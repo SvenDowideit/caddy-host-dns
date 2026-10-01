@@ -132,6 +132,7 @@ Caddyfile (global option):
 {
 	dns_records {
 		provider gandi {env.GANDI_TOKEN} {
+			zone fi.gy
 			record otel.fi.gy    A     10.10.0.5
 			record otlp.fi.gy    A     10.10.0.6
 			record gateway.fi.gy CNAME otel.fi.gy.
@@ -177,9 +178,19 @@ Removal syntax: `remove <name> <type> [value...]`
 - Without values: delete **all** records of that `(name,type)` RRset.
 - Applied on every reconcile via `DeleteRecords`; purely declarative (no memory of prior
   config). Removal is the explicit, opt-in counterpart to `record` create/update.
+- Removals are **resolved against the zone's live records first** (via `libdns.RecordGetter`),
+  then deleted. This makes whole-RRset removal work even for providers whose
+  `DeleteRecords` requires an exact value match (e.g. `libdns/powerdns`), and makes removal
+  independent of TTL mismatches.
 
-Inside a provider's block, the names `record` and `remove` are reserved for this app;
-everything else belongs to the DNS provider module (whether inline args or block
+Zone syntax: `zone <zone>`
+
+- Sets the zone for this provider's records/removals lacking their own `zone`. Optional at
+  both levels. When omitted, the zone is derived per name from the provider's
+  `libdns.ZoneLister`; if the provider has no `ZoneLister`, a zone directive is required.
+
+Inside a provider's block, the names `record`, `remove`, and `zone` are reserved for this
+app; everything else belongs to the DNS provider module (whether inline args or block
 subdirectives), same as `domains` in `caddy-dynamicdns`.
 
 Equivalent JSON:
@@ -220,6 +231,9 @@ type App struct {
 	// Default TTL applied when a record omits its own. Optional.
 	TTL caddy.Duration `json:"ttl,omitempty"`
 
+	// Default zone for records/removals without their own. Optional.
+	Zone string `json:"zone,omitempty"`
+
 	// Downgrade reconcile failures to logged errors instead of failing Start. Optional.
 	BestEffort bool `json:"best_effort,omitempty"`
 
@@ -232,8 +246,12 @@ type Provider struct {
 	Records        []RecordSpec    `json:"records,omitempty"`
 	// Explicit removals; applied every reconcile.
 	Removals []RemoveSpec `json:"remove,omitempty"`
+	// Default zone for this provider. Optional.
+	Zone string `json:"zone,omitempty"`
 
 	dnsProvider libdns.RecordSetter
+	getter      libdns.RecordGetter
+	deleter     libdns.RecordDeleter
 }
 
 type RecordSpec struct {
@@ -275,9 +293,10 @@ type RemoveSpec struct {
      - `CNAME`: exactly one value, a hostname (not an IP);
      - `Name` non-empty;
    - Validate every `RemoveSpec` the same way, except values are optional.
-   - Resolve `Zone` per record/removal: explicit → else, if the provider implements
-     `libdns.ZoneLister`, pick the longest zone from `ListZones()` that is a suffix of
-     `Name` → else error telling the operator to set `zone`.
+   - Resolve `Zone` per record/removal: explicit `zone` on the record/removal → the
+     provider's `zone` → the app's top-level `zone` → else, if the provider implements
+     `libdns.ZoneLister`, the longest zone from `ListZones()` that is a suffix of `Name`
+     → else error telling the operator to set `zone`.
    - Apply TTL precedence: record `TTL` → app `TTL` → `0` (provider default).
 
 2. **`Start()`** — one immediate reconcile pass, then return. No goroutine, no ticker.
@@ -291,12 +310,14 @@ Reconcile pass, grouped by `zone`:
   - `A`/`AAAA` → one `libdns.Address` per value (`Name` made relative to zone via
     `libdns.RelativeName`, `TTL`, `IP`);
   - `CNAME` → one `libdns.CNAME` (`Name`, `TTL`, `Target`).
-- If any removals exist, assert the provider implements `libdns.RecordDeleter` (all real
-  providers do); build `[]libdns.Record` for the removals, with empty `Data` when no value
-  is given (libdns semantics: empty value matches all values of that `(name,type)`).
+- If any removals exist, require the provider to implement both `libdns.RecordGetter` and
+  `libdns.RecordDeleter`. For each removal, call `GetRecords`, select live records whose
+  relative name and type match (and, when a value is given, whose data equals it), and
+  delete those concrete records. Empty-value removals therefore delete the whole RRset
+  regardless of the provider's exact-match semantics or TTL.
 - Call `p.dnsProvider.SetRecords(ctx, zone, recs)` once per zone (creates/updates; owns
-  each declared `(name,type)` RRset). Then call `DeleteRecords(ctx, zone, removals)` for
-  the explicit removals. Log a compact summary.
+  each declared `(name,type)` RRset). Then `DeleteRecords(ctx, zone, resolved)`. Log a
+  compact summary.
 - On error: log and fail unless `BestEffort`.
 
 ### 4.5 Idempotency, ownership & drift
@@ -354,8 +375,10 @@ is designed but **deferred**.
   - validation rejects: unknown type, IP/type mismatch, CNAME with 0 or >1 values,
     CNAME target that is an IP, unresolved zone;
   - reconcile calls `SetRecords` once per zone with the expected records;
-  - `remove` builds the expected delete records, including empty-value (whole RRset) and
-    explicit-value forms, and calls `DeleteRecords`;
+  - `remove` resolves against the provider's `GetRecords` output (live records) and builds
+    the expected delete records, including empty-value (whole RRset) and explicit-value
+    forms, and calls `DeleteRecords`;
+  - using `remove` with a provider lacking `RecordDeleter`/`RecordGetter` fails Provision;
   - `best_effort` on/off changes whether a provider error fails `Start`.
 - Caddyfile parse tests mirroring `caddyfile_test.go`: parse → JSON shape, including the
   legacy single-provider fold, multiple providers with nested `record`/`remove` blocks,
@@ -442,24 +465,31 @@ Researched shape (for later):
 ```
 caddy-host-dns/
   go.mod                              # github.com/SvenDowideit/caddy-host-dns
+  caddyhostdns.go                     # root package; blank-imports dnsrec for xcaddy
   LICENSE                             # Apache-2.0
   README.md
   caddy-dns-records-module.md         # this plan
   dnsrec/
     app.go                            # App, Provider, RecordSpec, RemoveSpec, lifecycle, reconcile
-    caddyfile.go                      # parseApp, parseRecords, normalizeProviders,
+    caddyfile.go                      # parseApp, parseRecord, parseRemove, zone, normalizeProviders,
                                       #   splitProviderSegment, unmarshalModuleTokens
     records.go                        # validation, zone resolution, libdns construction
     app_test.go                       # unit tests with fake provider
     caddyfile_test.go                 # parse tests (dummy provider)
   conformance/
     conformance.go                    # libdnstest wrapper + env config
+    smoke_test.go                     # in-memory example smoke (build tag)
     example/
-      powerdns_test.go                # worked example (build-tagged)
+      powerdns_test.go                # worked example (build tag)
   docker-compose.yml                  # PowerDNS aid for local conformance
+  .docker/pdns/api.conf               # PowerDNS API + webserver config
   .github/workflows/ci.yml
   e2e/                                # DEFERRED (placeholder + design notes)
 ```
+
+Note: the conformance layer needs `libdnstest`, which only exists on `libdns` master
+(after v1.1.1). The module therefore pins `github.com/libdns/libdns` to a master
+pseudo-version; retarget to a tagged release when one contains `libdnstest`.
 
 ---
 
@@ -484,11 +514,11 @@ caddy-host-dns/
 
 ## 9. Phasing
 
-- **v1 (this plan)**: module (§4) including `record` create/update and `remove` deletion,
-  unit + parse tests (§6.1), provider conformance via `libdnstest` (§6.2), CI (§6.3),
-  PowerDNS compose aid.
-- **v1.1**: per-provider default zone, clearer provider-capability errors, optional
-  whole-zone authoritative mode (see §10).
+- **v1 (this plan)**: module (§4) including `record` create/update, `remove` deletion,
+  the `zone` directive, unit + parse tests (§6.1), provider conformance via `libdnstest`
+  (§6.2), CI (§6.3), PowerDNS compose aid.
+- **v1.1**: clearer provider-capability errors, optional whole-zone authoritative mode
+  (see §10).
 - **Deferred**: containerized black-box E2E (§6.4); `@svendowideit/caddy` integration
   (§5); additional record types (SRV/TXT/CAA) if a later need arises.
 
@@ -499,14 +529,15 @@ caddy-host-dns/
 1. **Conformance record scope**: TXT/A/CNAME are always tested by `libdnstest`; TXT is
    accepted (it proves the provider's generic capability even though the module manages
    only A/AAAA/CNAME). Other types are skipped via `SkipRRTypes`.
-2. **Zone requirement**: explicit `zone` wins; otherwise derive via `ZoneLister` at
-   Provision; otherwise fail with a clear error telling the operator to set `zone`.
+2. **Zone requirement**: explicit `zone` (top-level default or per provider/record) wins;
+   otherwise derive via `ZoneLister` at Provision; otherwise fail with a clear error
+   telling the operator to set `zone`.
 3. **`update_only`**: dropped. The module's purpose is to create/update records; the
    owned-RRset `SetRecords` primitive already does create+update. Automatic removal of
    undeclared names is deliberately absent.
 4. **Removal**: explicit `remove` directive in v1 (whole `(name,type)` RRset, or specific
-   values), re-applied every reconcile via `DeleteRecords`. A future whole-zone
-   authoritative mode remains possible (v1.1).
+   values), re-applied every reconcile and resolved against live records before deletion.
+   A future whole-zone authoritative mode remains possible (v1.1).
 5. **Dry-run/plan**: dropped. It does not help creation and the fail-loud reconcile plus
    explicit `remove` cover the safety need.
 6. **Conformance packaging**: a package inside this module (not a separate module).

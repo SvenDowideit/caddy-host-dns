@@ -1,0 +1,24 @@
+# Local PowerDNS for provider conformance tests.
+#
+# Start:  docker compose up -d
+# The API is then available at http://127.0.0.1:8081 with api-key "secret",
+# matching github.com/libdns/powerdns defaults. Create a dedicated test zone
+# and run the conformance tests against it:
+#
+#   CONFORMANCE_PROVIDER_JSON='{"name":"powerdns","server_url":"http://127.0.0.1:8081","api_token":"secret"}' \
+#   CONFORMANCE_ZONE=example.com. \
+#   go test -tags conformance -v ./conformance/example/...
+#
+# WARNING: the suite creates and deletes records named "test-*". Use a
+# dedicated test zone only.
+services:
+  powerdns:
+    image: powerdns/pdns-auth-49
+    networks:
+      - backend
+    volumes:
+      - ./.docker/pdns:/etc/powerdns/pdns.d
+    ports:
+      - 8081:8081
+networks:
+  backend: {}
