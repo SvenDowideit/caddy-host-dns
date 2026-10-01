@@ -27,6 +27,15 @@ throwaway PowerDNS via `docker compose`, applies [`examples/Caddyfile`](./exampl
 and serves on `:8080`. Inspect the created records in the local PowerDNS API or with
 `make pdns-logs`.
 
+To prove a provider works end-to-end, the suite can be run against a local server
+(see [Provider conformance tests](#provider-conformance-tests)):
+
+```
+make conformance-bind    # local BIND over RFC2136 — passes the full suite
+make conformance-live    # local PowerDNS — see the note on TXT
+make bind-down pdns-down # clean up
+```
+
 ## Install
 
 Build a Caddy binary that includes this module and the DNS provider(s) you use:
@@ -103,21 +112,70 @@ Equivalent JSON:
 
 The `conformance` package runs the official
 [`libdns` test suite](https://github.com/libdns/libdns/tree/master/libdnstest) against a
-provider you compile into the test binary, proving the provider + credentials + zone work.
+provider you compile into the test binary, proving the provider + its API settings + a
+zone all work together. The provider must be a dependency of the test binary; the
+bundled examples register PowerDNS and RFC2136, and you can add your own.
 
-```
-CONFORMANCE_PROVIDER_JSON='{"name":"powerdns","server_url":"http://127.0.0.1:8081","api_token":"secret"}' \
-CONFORMANCE_ZONE=example.com. \
-go test -tags conformance -v ./conformance/...
+There are two ways to run it:
+
+- **Against a provider's real API**, by supplying its `dns_provider` JSON and a zone:
+
+  ```sh
+  CONFORMANCE_PROVIDER_JSON='{"name":"cloudflare","api_token":"..."}' \
+  CONFORMANCE_ZONE=example.com. \
+  go test -tags conformance -v ./conformance/...
+  ```
+
+- **Against a local server**, using the provided `docker compose` services:
+
+  ```sh
+  make conformance-bind   # local BIND, RFC2136 dynamic updates — passes fully
+  make conformance-live   # local PowerDNS — fails the TXT cases (see below)
+  ```
+
+> **Use a dedicated test zone.** The suite creates, modifies, and deletes records named
+> `test-*`. Never point it at a zone with real data.
+
+### A note on PowerDNS and TXT
+
+`make conformance-live` currently **fails the suite's TXT test cases**, because of a known
+bug in the upstream [`libdns/powerdns`](https://github.com/libdns/powerdns) provider: its
+read path (`GetRecords`) never unquotes TXT values, so they come back wrapped in extra
+quotes (e.g. `"\"hello\""` instead of `"hello"`). libdns's `TXT.RR()` requires the `Data`
+to equal the unquoted `Text`, so the round-trip comparison fails. This is tracked upstream
+(see `libdns/powerdns` PR #12).
+
+Everything else passes: the A, AAAA, and CNAME cases are green, and those are the only
+record types `dns_records` manages. This is exactly what a conformance suite is for — it
+tells you *where* the problem is. For a fully green local run, use
+`make conformance-bind`, which exercises the same wrapper against
+[`libdns/rfc2136`](https://github.com/libdns/rfc2136) and a local BIND.
+
+### Adding your own provider
+
+Add a test file with the provider imported and call the wrapper:
+
+```go
+//go:build conformance
+
+package conformance_test
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/SvenDowideit/caddy-host-dns/conformance"
+	_ "github.com/caddy-dns/cloudflare"
+)
+
+func TestMyProvider(t *testing.T) {
+	provider := json.RawMessage(`{"name":"cloudflare","api_token":"..."}`)
+	conformance.Run(t, provider, "example.com.")
+}
 ```
 
-**Use a dedicated test zone**: the suite creates and deletes records named `test-*`.
-
-A local PowerDNS for development is provided via `docker-compose.yml`:
-
-```
-docker compose up -d
-```
+See [`conformance/example/providers_test.go`](./conformance/example/providers_test.go) for
+the PowerDNS and RFC2136 examples.
 
 ## License
 

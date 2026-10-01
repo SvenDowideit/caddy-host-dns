@@ -6,6 +6,7 @@
 #   make conformance       # provider conformance smoke (in-memory, no creds)
 #   make run               # build Caddy + module and try examples/Caddyfile
 #   make conformance-live  # local PowerDNS: start, seed, run conformance
+#   make conformance-bind  # local BIND/RFC2136: full suite, passes
 #   make ci                # everything CI runs
 
 # --- configuration ---------------------------------------------------------
@@ -27,8 +28,12 @@ XCADDY ?= $(shell command -v xcaddy 2>/dev/null || $(GO) env GOPATH)/bin/xcaddy
 PDNS_URL   ?= http://127.0.0.1:8081
 PDNS_KEY   ?= secret
 TEST_ZONE  ?= example.com.
-CONFORMANCE_PROVIDER_JSON ?= {"name":"powerdns","server_url":"$(PDNS_URL)","api_token":"$(PDNS_KEY)"}
-CONFORMANCE_ZONE ?= $(TEST_ZONE)
+
+# Local BIND (RFC2136 dynamic updates over TSIG)
+BIND_SERVER ?= 127.0.0.1:5354
+BIND_KEYNAME ?= rfc2136-key
+BIND_KEYALG  ?= hmac-sha256
+BIND_KEY     ?= cWnu6Ju9zOki4f7Q+da2KKGo0KOXbCf6Pej6hW3geC4=
 
 # --- meta ------------------------------------------------------------------
 
@@ -138,13 +143,55 @@ pdns-logs: ## Follow local PowerDNS logs
 pdns-down: ## Stop local PowerDNS and remove its data
 	docker compose down -v
 
-# --- conformance against a live provider -----------------------------------
+# --- conformance against live local providers ------------------------------
 
 .PHONY: conformance-live
 conformance-live: pdns-up pdns-seed ## Run conformance against local PowerDNS
-	@echo "Note: some providers (e.g. upstream libdns/powerdns) fail the suite's"
-	@echo "TXT cases; dns_records itself only manages A/AAAA/CNAME."
+	@echo "==========================================================================="
+	@echo " Running the libdns conformance suite against local PowerDNS."
 	@echo
-	CONFORMANCE_PROVIDER_JSON='$(CONFORMANCE_PROVIDER_JSON)' \
-	CONFORMANCE_ZONE='$(CONFORMANCE_ZONE)' \
-		$(GO) test $(GOFLAGS) -tags conformance -count=1 -v ./conformance/example/...
+	@echo " EXPECTED FAILURE: the TXT cases fail due to a known bug in the upstream"
+	@echo " libdns/powerdns provider (its read path returns TXT values wrapped in"
+	@echo " extra quotes). The A, AAAA, and CNAME cases pass, and dns_records itself"
+	@echo " only manages A/AAAA/CNAME. For a fully green run, use: make conformance-bind"
+	@echo "==========================================================================="
+	@echo
+	CONFORMANCE_ZONE='$(TEST_ZONE)' \
+	CONFORMANCE_PDNS_URL='$(PDNS_URL)' \
+	CONFORMANCE_PDNS_TOKEN='$(PDNS_KEY)' \
+		$(GO) test $(GOFLAGS) -tags conformance -count=1 -v -run TestPowerDNS ./conformance/example/...
+
+.PHONY: conformance-bind
+conformance-bind: bind-up ## Run conformance against local BIND (RFC2136); passes fully
+	CONFORMANCE_ZONE='$(TEST_ZONE)' \
+	CONFORMANCE_RFC2136_SERVER='$(BIND_SERVER)' \
+	CONFORMANCE_RFC2136_KEYNAME='$(BIND_KEYNAME)' \
+	CONFORMANCE_RFC2136_KEYALG='$(BIND_KEYALG)' \
+	CONFORMANCE_RFC2136_KEY='$(BIND_KEY)' \
+		$(GO) test $(GOFLAGS) -tags conformance -count=1 -v -run TestBindRFC2136 ./conformance/example/...
+
+# --- local BIND (RFC2136) --------------------------------------------------
+
+.PHONY: bind-up
+bind-up: ## Start local BIND and wait for DNS
+	@mkdir -p .docker/bind/zones
+	@test -f .docker/bind/zones/db.example.com || cp .docker/bind/db.example.com.template .docker/bind/zones/db.example.com
+	@chmod -R a+rwX .docker/bind/zones
+	docker compose --profile bind up -d bind
+	@printf "waiting for BIND"; \
+	for i in $$(seq 1 30); do \
+		if dig +short +time=1 +tries=1 @127.0.0.1 -p 5354 $(TEST_ZONE) SOA >/dev/null 2>&1; then \
+			echo " ready"; exit 0; \
+		fi; \
+		printf "."; sleep 1; \
+	done; \
+	echo " timed out"; docker compose --profile bind logs --no-color bind; exit 1
+
+.PHONY: bind-logs
+bind-logs: ## Follow local BIND logs
+	docker compose --profile bind logs -f bind
+
+.PHONY: bind-down
+bind-down: ## Stop local BIND and remove its data
+	docker compose --profile bind down -v
+	rm -rf .docker/bind/zones

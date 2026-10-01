@@ -82,6 +82,8 @@ github.com/bits-and-blooms/bitset v1.25.0 h1:0Ro0qF4abCkM6SqWPVj29sFhAbMPAZpaDD7
 github.com/bits-and-blooms/bitset v1.25.0/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=
 github.com/caddy-dns/powerdns v1.0.2 h1:Biifa1fOiWdxDIrR/riQN9c0RQFIPcdvNQrK1aJDflg=
 github.com/caddy-dns/powerdns v1.0.2/go.mod h1:aRALD+d7BNGjD4+hr7zt2Hw6uT0cQ2q0UmvFr4+imgs=
+github.com/caddy-dns/rfc2136 v1.0.0 h1:UIug15TcfTGJqC5V02oWiaPlGdwYR2/x4E+3pqXHnLc=
+github.com/caddy-dns/rfc2136 v1.0.0/go.mod h1:eX1nUtdTYvPvYOkqdJihEKB6Y30oqrSb7yTnTRbiM7A=
 github.com/caddyserver/caddy/v2 v2.11.6 h1:sWxeamdlCZvcH4qeDz8bB0mdxgfYTeqV7HxOjXyIRas=
 github.com/caddyserver/caddy/v2 v2.11.6/go.mod h1:n9f2OINNRIVbA6busygFHIj/nZ3YqC6Nc4DZFcfw0Wk=
 github.com/caddyserver/certmagic v0.25.6 h1:vHMtFSLKTa6kuZz6w0SnRMpQ388tSkww8ye355BgAM4=
@@ -221,6 +223,8 @@ github.com/libdns/libdns v1.2.0-alpha.1.0.20260625195721-43599001f01c h1:BnButgl
 github.com/libdns/libdns v1.2.0-alpha.1.0.20260625195721-43599001f01c/go.mod h1:tlz+BwSa2aeKILtHkESBUQi0hClU2xYbkwPQnlljEMM=
 github.com/libdns/powerdns v0.1.4 h1:QdQ+FL2t5ky2UYiWSodbz2HOwQkCWpd+WGa4OoWGpBk=
 github.com/libdns/powerdns v0.1.4/go.mod h1:kTRi2e4sCcValWW6iWwyfcvFXvlxl1mn83vDAgq8bhA=
+github.com/libdns/rfc2136 v1.0.0 h1:hy+cCMdBULFYNKh/S0feVe2zWRhEZ74lTshdbXABIoY=
+github.com/libdns/rfc2136 v1.0.0/go.mod h1:H216T2WTCGpsvPaoIVVe6Y26hdZT5RcsBqwIKE4l1iY=
 github.com/magiconair/properties v1.8.0/go.mod h1:PppfXfuXeibc/6YijjN8zIbojt8czPbwD3XqdrwzmxQ=
 github.com/manifoldco/promptui v0.9.0 h1:3V4HzJk1TtXW1MTZMP7mdlwbBpIinw3HztaIlYthEiA=
 github.com/manifoldco/promptui v0.9.0/go.mod h1:ka04sppxSGFAtxX0qhlYQjISsg9mR4GWtQEhdbn6Pgg=

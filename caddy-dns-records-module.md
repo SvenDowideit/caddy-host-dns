@@ -410,18 +410,24 @@ report of what did not.
   )
 
   func TestMyProvider(t *testing.T) {
-      conformance.RunFromEnv(t) // CONFORMANCE_PROVIDER_JSON, CONFORMANCE_ZONE
+      provider := json.RawMessage(`{"name":"cloudflare","api_token":"..."}`)
+      conformance.Run(t, provider, "example.com.")
   }
   ```
-- We ship a worked example (`conformance/example/powerdns_test.go`) using
-  `github.com/caddy-dns/powerdns`, and docs describing the safe pattern: **use a
-  dedicated test zone/domain**; the suite writes and deletes `test-*` records.
-- Synthetic/local backend aid: a plain `docker-compose.yml` running PowerDNS auth
-  (`powerdns/pdns-auth-49`, API on `:8081`, key `secret`, matching libdns/powerdns) so a
-  developer can point the conformance test at `http://localhost:8081` and a locally
-  seeded zone. No orchestration code — start it with `docker compose up -d`, run
-  `go test -tags conformance`. Real-provider runs use the same test with real provider
-  JSON + zone.
+  `RunFromEnv(t)` (using `CONFORMANCE_PROVIDER_JSON` + `CONFORMANCE_ZONE`) is also provided.
+- We ship worked examples (`conformance/example/providers_test.go`) for
+  `github.com/caddy-dns/powerdns` and `github.com/caddy-dns/rfc2136`, each gated on its own
+  env var so plain `go test -tags conformance ./...` runs only the in-memory smoke.
+- **Known upstream issue**: the suite's TXT cases fail against `libdns/powerdns` because its
+  read path never unquotes TXT (returns `"\"v\""`), and libdns v1 treats TXT as an essential
+  (unskippable) type. A/AAAA/CNAME pass, which is all this module manages. `make
+  conformance-live` documents this loudly instead of hiding it.
+- To have a **fully green** local run, `make conformance-bind` runs the same wrapper against
+  `libdns/rfc2136` + a local BIND (`internetsystemsconsortium/bind9`, RFC2136 dynamic
+  updates over TSIG on `:5354`); libdns/rfc2136 handles TXT correctly.
+- Synthetic/local backend aid: a `docker-compose.yml` with a default PowerDNS service
+  (`powerdns/pdns-auth-49`, API on `:8081`, key `secret`) and a `bind` profile
+  (`.docker/bind/`) for RFC2136. No orchestration code — driven by the Makefile.
 - CI guard: an always-on conformance **smoke** against `libdns/libdns/libdnstest/example`
   (in-memory provider) proves our wrapper runs the suite correctly, without live creds.
 
@@ -482,9 +488,10 @@ caddy-host-dns/
     conformance.go                    # libdnstest wrapper + env config
     smoke_test.go                     # in-memory example smoke (build tag)
     example/
-      powerdns_test.go                # worked example (build tag)
-  docker-compose.yml                  # PowerDNS aid for local conformance
+      providers_test.go               # PowerDNS + RFC2136 examples (build tag)
+  docker-compose.yml                  # PowerDNS default + BIND/RFC2136 profile
   .docker/pdns/api.conf               # PowerDNS API + webserver config
+  .docker/bind/                       # BIND named.conf, TSIG key, zone template
   .github/workflows/ci.yml
   e2e/                                # DEFERRED (placeholder + design notes)
 ```

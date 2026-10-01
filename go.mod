@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/caddy-dns/powerdns v1.0.2
+	github.com/caddy-dns/rfc2136 v1.0.0
 	github.com/caddyserver/caddy/v2 v2.11.6
 	github.com/libdns/libdns v1.2.0-alpha.1.0.20260625195721-43599001f01c
 	go.uber.org/zap v1.28.0
@@ -65,6 +66,7 @@ require (
 	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/libdns/powerdns v0.1.4 // indirect
+	github.com/libdns/rfc2136 v1.0.0 // indirect
 	github.com/manifoldco/promptui v0.9.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect

@@ -14,26 +14,12 @@
 
 //go:build conformance
 
-// Package conformance_test is a worked example of running provider conformance
-// tests against a real provider compiled into this test binary.
-//
-// Start the local PowerDNS via `docker compose up -d`, seed a zone, then:
-//
-//	CONFORMANCE_PROVIDER_JSON='{"name":"powerdns","server_url":"http://127.0.0.1:8081","api_token":"secret"}' \
-//	CONFORMANCE_ZONE=example.com. \
-//	go test -tags conformance -v ./conformance/example/...
-//
-// WARNING: the suite creates and deletes records named "test-*". Only ever
-// point this at a dedicated test zone.
 package conformance_test
 
+// Register the DNS provider modules under test. To test your own provider,
+// add its blank import here (or in your own test file) and call
+// conformance.Run with its config.
 import (
-	"testing"
-
-	"github.com/SvenDowideit/caddy-host-dns/conformance"
 	_ "github.com/caddy-dns/powerdns"
+	_ "github.com/caddy-dns/rfc2136"
 )
-
-func TestPowerDNS(t *testing.T) {
-	conformance.RunFromEnv(t)
-}
