@@ -1,0 +1,33 @@
+{
+	admin localhost:2019
+
+	dns_records {
+		provider rfc2136 {
+			key_name e2e-key
+			key_alg  hmac-sha256
+			key      cWnu6Ju9zOki4f7Q+da2KKGo0KOXbCf6Pej6hW3geC4=
+			server   bind-e2e:53
+			zone     example.com.
+
+			# DELETE stage: keep alpha and delta, explicitly remove beta and
+			# gamma (both whole-RRset removals).
+			record alpha.example.com A 172.31.241.10
+			record delta.example.com CNAME alpha.example.com.
+
+			remove beta.example.com  A
+			remove gamma.example.com A
+		}
+		ttl 60s
+	}
+}
+
+# Each site binds the IP endpoint(s) its DNS records point to.
+http://alpha.example.com {
+	bind 172.31.241.10
+	respond "site=alpha served-by={http.request.local.host}"
+}
+
+http://delta.example.com {
+	bind 172.31.241.10
+	respond "site=delta served-by={http.request.local.host}"
+}

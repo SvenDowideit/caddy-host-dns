@@ -7,6 +7,8 @@
 #   make run               # build Caddy + module and try examples/Caddyfile
 #   make conformance-live  # local PowerDNS: start, seed, run conformance
 #   make conformance-bind  # local BIND/RFC2136: full suite, passes
+#   make e2e               # containerized BIND e2e (xcaddy-built Caddy)
+#   make e2e-download      # containerized BIND e2e (caddyserver.com Caddy)
 #   make ci                # everything CI runs
 
 # --- configuration ---------------------------------------------------------
@@ -87,6 +89,33 @@ ci: fmt-check vet build test conformance ## Run the full CI suite locally
 .PHONY: clean
 clean: ## Remove build artifacts
 	rm -f $(CADDY_BIN)
+
+# --- download a Caddy binary from caddyserver.com/download ------------------
+
+# Build a Caddy binary using the hosted download service. NOTE: the service
+# only builds package paths listed in its registry
+# (https://caddyserver.com/api/packages). Until this module is registered there,
+# the service returns HTTP 400 "is not a registered Caddy module package path".
+# Register at https://caddyserver.com/account/register-package, or use
+# `make xcaddy` / `make e2e` (the xcaddy build has no such restriction).
+DOWNLOAD_CADDY ?= caddy-download
+
+.PHONY: download
+download: ## Download Caddy from caddyserver.com/download with dns_records + PROVIDER
+	@url="https://caddyserver.com/api/download?os=linux&arch=amd64"; \
+	url="$$url&p=$(MODULE)"; \
+	url="$$url&p=$(PROVIDER)"; \
+	echo "GET $$url"; \
+	curl -fsSL "$$url" -o $(DOWNLOAD_CADDY) || { \
+		echo; \
+		echo "Download failed. The caddyserver.com build service only builds"; \
+		echo "module paths in its registry (https://caddyserver.com/api/packages)."; \
+		echo "If $(MODULE) is not registered yet, use 'make xcaddy' instead."; \
+		exit 1; \
+	}; \
+	chmod +x $(DOWNLOAD_CADDY); \
+	$(DOWNLOAD_CADDY) version; \
+	$(DOWNLOAD_CADDY) list-modules | grep -E 'dns_records|dns\.providers\.' || true
 
 # --- build a real Caddy with the module ------------------------------------
 
@@ -195,3 +224,43 @@ bind-logs: ## Follow local BIND logs
 bind-down: ## Stop local BIND and remove its data
 	docker compose --profile bind down -v
 	rm -rf .docker/bind/zones
+
+# --- containerized end-to-end smoke test -----------------------------------
+
+# Builds Caddy with e2e/build-caddy.sh (inside a container, but reusing your Go
+# module/build caches via bind mounts, so nothing is re-downloaded), runs BIND +
+# Caddy + a tools container on a private network, then drives create/modify/
+# delete stages and verifies each with dig and curl via `docker exec`.
+E2E_PROVIDER ?= github.com/caddy-dns/rfc2136
+
+.PHONY: e2e
+e2e: ## Run the containerized BIND e2e (builds Caddy via xcaddy in a container)
+	E2E_PROVIDER=$(E2E_PROVIDER) ./e2e/run.sh
+
+.PHONY: e2e-build
+e2e-build: ## Build e2e/bin/caddy only (reusing host Go caches)
+	E2E_PROVIDER=$(E2E_PROVIDER) ./e2e/build-caddy.sh
+
+.PHONY: e2e-download
+e2e-download: ## Download Caddy from caddyserver.com/download into e2e/bin/caddy
+	@curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64&p=$(MODULE)&p=$(E2E_PROVIDER)" -o e2e/bin/caddy || { \
+		echo; \
+		echo "Download failed. The caddyserver.com build service only builds module"; \
+		echo "paths in its registry (https://caddyserver.com/api/packages). Until"; \
+		echo "$(MODULE) is registered, use 'make e2e' (xcaddy) instead."; \
+		exit 1; \
+	}
+	chmod +x e2e/bin/caddy
+	E2E_SKIP_BUILD=1 E2E_PROVIDER=$(E2E_PROVIDER) ./e2e/run.sh
+
+.PHONY: e2e-config
+e2e-config: ## Validate the e2e compose file
+	docker compose -f e2e/docker-compose.yml config >/dev/null && echo "e2e compose OK"
+
+.PHONY: e2e-down
+e2e-down: ## Stop the e2e containers and network
+	docker compose -f e2e/docker-compose.yml down -v --remove-orphans
+
+.PHONY: e2e-clean
+e2e-clean: ## Remove the e2e-built Caddy binary
+	rm -rf e2e/bin

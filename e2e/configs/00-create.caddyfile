@@ -1,0 +1,38 @@
+{
+	admin localhost:2019
+
+	dns_records {
+		provider rfc2136 {
+			key_name e2e-key
+			key_alg  hmac-sha256
+			key      cWnu6Ju9zOki4f7Q+da2KKGo0KOXbCf6Pej6hW3geC4=
+			server   bind-e2e:53
+			zone     example.com.
+
+			# CREATE stage: alpha resolves to both Caddy endpoints, beta to
+			# net1, gamma to net2.
+			record alpha.example.com A 172.31.240.10
+			record alpha.example.com A 172.31.241.10
+			record beta.example.com  A 172.31.240.10
+			record gamma.example.com A 172.31.241.10
+		}
+		ttl 60s
+	}
+}
+
+# Each site binds the IP endpoint(s) its DNS records point to, so the HTTP
+# response proves the name is served from exactly those addresses.
+http://alpha.example.com {
+	bind 172.31.240.10 172.31.241.10
+	respond "site=alpha served-by={http.request.local.host}"
+}
+
+http://beta.example.com {
+	bind 172.31.240.10
+	respond "site=beta served-by={http.request.local.host}"
+}
+
+http://gamma.example.com {
+	bind 172.31.241.10
+	respond "site=gamma served-by={http.request.local.host}"
+}

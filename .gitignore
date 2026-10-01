@@ -1,6 +1,8 @@
 /caddy
+/caddy-download
 /dist
 *.test
 *.out
 .env
 /.docker/bind/zones/
+/e2e/bin/

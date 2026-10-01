@@ -1,0 +1,70 @@
+name: caddy-host-dns-e2e
+
+# End-to-end smoke test:
+#   - bind   : authoritative BIND, accepts RFC2136 dynamic updates (TSIG)
+#   - caddy  : a Caddy binary built with the dns_records module + rfc2136
+#   - tools  : dig + curl, used only for verification via `docker exec`
+#
+# caddy is attached to two networks so it has two IP endpoints, which lets the
+# test prove that a single name with multiple A values resolves to, and is
+# served from, more than one address. tools is attached to both so it can reach
+# every caddy endpoint; bind only needs net1.
+#
+# The Caddy binary is built by e2e/build-caddy.sh (see the Makefile) and copied
+# into a small runtime image; see e2e/Dockerfile.runtime.
+
+services:
+  bind:
+    container_name: bind-e2e
+    build:
+      context: ..
+      dockerfile: e2e/bind/Dockerfile
+    healthcheck:
+      test: ["CMD", "dig", "+short", "+time=1", "+tries=1", "@127.0.0.1", "example.com", "SOA"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    networks:
+      net1:
+        ipv4_address: 172.31.240.11
+
+  caddy:
+    container_name: caddy-e2e
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile.runtime
+    command: run --config /configs/00-create.caddyfile --adapter caddyfile
+    volumes:
+      - ./configs:/configs:ro
+    networks:
+      net1:
+        ipv4_address: 172.31.240.10
+      net2:
+        ipv4_address: 172.31.241.10
+    depends_on:
+      bind:
+        condition: service_healthy
+
+  tools:
+    container_name: tools-e2e
+    build:
+      context: ..
+      dockerfile: e2e/tools/Dockerfile
+    networks:
+      net1:
+        ipv4_address: 172.31.240.12
+      net2:
+        ipv4_address: 172.31.241.12
+    depends_on:
+      - caddy
+
+networks:
+  net1:
+    ipam:
+      config:
+        - subnet: 172.31.240.0/24
+  net2:
+    ipam:
+      config:
+        - subnet: 172.31.241.0/24

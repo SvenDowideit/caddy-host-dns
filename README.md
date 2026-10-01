@@ -36,6 +36,14 @@ make conformance-live    # local PowerDNS — see the note on TXT
 make bind-down pdns-down # clean up
 ```
 
+For a full black-box smoke test — Caddy serving HTTP from records it creates,
+modifies, and deletes in a containerized BIND — see [`e2e/`](./e2e/):
+
+```
+make e2e                 # build Caddy (xcaddy) and run the containerized e2e
+make e2e-download        # same, using a caddyserver.com/download binary
+```
+
 ## Install
 
 Build a Caddy binary that includes this module and the DNS provider(s) you use:

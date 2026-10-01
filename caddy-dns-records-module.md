@@ -440,29 +440,28 @@ report of what did not.
 - Real-provider conformance is never run in CI (needs secrets); documented as a local,
   opt-in command.
 
-### 6.4 Deferred: containerized black-box Caddy+PowerDNS E2E
+### 6.4 Containerized black-box Caddy + BIND E2E (implemented)
 
-Designed, decision-open, **not built now**. Rationale: it validates the module through
-its real Caddyfile/JSON entry point, which unit tests cannot, but needs orchestration we
-have not chosen.
+Built in `e2e/`. Runs Caddy against a real BIND (RFC2136 dynamic updates) on a
+private Docker network, and verifies through Caddy's own admin API and Caddyfile:
 
-Researched shape (for later):
-
-- **Image**: `Dockerfile` using a build arg,
-  `xcaddy build --with github.com/SvenDowideit/caddy-host-dns --with github.com/caddy-dns/<provider>`,
-  so any user/provider gets a tested binary from one recipe.
-- **Two containers**: `caddy` (the module under test) and `powerdns` (auth + API), on a
-  shared compose network; a throwaway `dig`/tools sidecar for verification, plus
-  `docker exec` into the Caddy container to inspect `/config/` and logs.
-- **Generated configs**: harnesses create Caddyfiles using `dns_records { provider
-  powerdns {env.PDNS_SERVER_URL} {env.PDNS_TOKEN} record ... }`, seed a synthetic zone,
-  then assert via `dig` and `docker exec`: A/AAAA/CNAME create; idempotent reload;
-  prune on value change; multi-record A; validation error fails config; auth error is
-  reported clearly; TTL applied; optional zone auto-detect.
-- **Real provider**: same harness with real provider JSON fragment + real zone + creds
-  from env/file; synthetic record names under the real zone, cleaned up.
-- **Open decision**: Go tests orchestrating `testcontainers-go`, vs `Makefile`+`docker
-  compose`, vs a small standalone runner. To be decided when we build it.
+- **Build**: `e2e/build-caddy.sh` runs `xcaddy` inside a container but bind-mounts
+  the host `$GOPATH/pkg` and `$GOCACHE`, so nothing is re-downloaded and objects are
+  reused; the ~50 MB binary is copied into a small alpine runtime image. `docker run`
+  + `-v` is used instead of a Dockerfile build because the target Docker lacks
+  BuildKit/buildx (`RUN --mount=type=cache` unavailable), where a Dockerfile build
+  would freeze GBs of Go caches into image layers. Also drives a
+  `caddyserver.com/download` binary path (`make e2e-download`).
+- **Containers**: `bind`, `caddy` (two network endpoints), `tools` (`dig` + `curl`).
+- **Stages** (each `caddy reload` via `docker exec`, verified with `dig`/`curl`):
+  create (multi-value A across both endpoints, plus A and CNAME), modify (prune an
+  A value, change a value, add a CNAME), delete (`remove` whole RRsets). Each site
+  `bind`s the endpoint(s) its records point to, so per-endpoint HTTP responses prove
+  the served addresses match DNS.
+- **Known limitation**: the hosted build service only builds module paths in its
+  registry (https://caddyserver.com/api/packages); the module must be registered at
+  https://caddyserver.com/account/register-package before `make e2e-download`
+  succeeds. The xcaddy path has no such restriction.
 
 ---
 

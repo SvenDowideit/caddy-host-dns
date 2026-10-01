@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1
+
+# Runtime image for the e2e Caddy container. The Caddy binary is built on the
+# host (or in a throwaway container) by e2e/build-caddy.sh, reusing the host Go
+# caches, and copied in here. This keeps the image tiny (~30 MB) and avoids
+# freezing gigabytes of Go caches into image layers.
+#
+# Build context is the repository root; e2e/bin/caddy must exist first.
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY e2e/bin/caddy /usr/bin/caddy
+EXPOSE 80 443 2019
+ENTRYPOINT ["caddy"]
