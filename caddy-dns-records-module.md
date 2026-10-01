@@ -468,6 +468,8 @@ caddy-host-dns/
   caddyhostdns.go                     # root package; blank-imports dnsrec for xcaddy
   LICENSE                             # Apache-2.0
   README.md
+  Makefile                            # new-user workflows (test, run, conformance, ci)
+  examples/Caddyfile                  # runnable example used by `make run`
   caddy-dns-records-module.md         # this plan
   dnsrec/
     app.go                            # App, Provider, RecordSpec, RemoveSpec, lifecycle, reconcile

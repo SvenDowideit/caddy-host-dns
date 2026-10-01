@@ -10,6 +10,23 @@ directive. There is no polling, no public-IP discovery, and no per-provider code
 
 See [caddy-dns-records-module.md](./caddy-dns-records-module.md) for the full design.
 
+## Try it in 30 seconds
+
+A `Makefile` wraps the common workflows. Requires Go and Docker:
+
+```
+make help        # list all targets
+make test        # unit + Caddyfile parse tests (no network, no credentials)
+make conformance # provider conformance smoke test (in-memory, no credentials)
+make run         # build Caddy + module, start local PowerDNS, apply examples/Caddyfile
+make pdns-down   # stop the local PowerDNS and clean up
+```
+
+`make run` builds a Caddy containing this module and the PowerDNS provider, starts a
+throwaway PowerDNS via `docker compose`, applies [`examples/Caddyfile`](./examples/Caddyfile),
+and serves on `:8080`. Inspect the created records in the local PowerDNS API or with
+`make pdns-logs`.
+
 ## Install
 
 Build a Caddy binary that includes this module and the DNS provider(s) you use:

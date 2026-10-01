@@ -1,0 +1,29 @@
+{
+	# Try it with: make run
+	#
+	# This runs against the local PowerDNS started by `docker compose up -d`
+	# (see Makefile), creating a few records in example.com.
+	admin off
+	dns_records {
+		provider powerdns {
+			server_url http://127.0.0.1:8081
+			api_token secret
+			zone example.com.
+
+			record otel.example.com    A     10.10.0.5
+			record otel.example.com    A     10.10.0.6
+			record obs.example.com     A     10.10.0.7 ttl 5m
+			record gateway.example.com CNAME otel.example.com.
+			record v6.example.com      AAAA  2001:db8::1
+
+			# Deleting here is explicit; uncomment to remove a name:
+			# remove stale.example.com A
+		}
+		ttl 1h
+	}
+}
+
+# A minimal site so Caddy has something to serve while we inspect DNS.
+:8080 {
+	respond "dns_records example — check the PowerDNS zone for the records above"
+}
