@@ -1,93 +1,121 @@
-# Spec: `caddy_dns_records` — a static, provider-agnostic DNS record Caddy module
+# Plan: `dns_records` — a static, provider-agnostic DNS record Caddy module (with a conformance test suite)
 
-Status: Draft (2026-10-01) — awaiting review.
+Status: Refined plan (2026-10-02) — ready to implement.
 Author: Sven
+Supersedes: earlier draft of this file.
 Related: `docs/otel-home-network-plan.md` §7.1/§7.1a, `docs/adr/0001-dns-tls-mechanism-caddy-first.md`,
 `docs/adr/0005-go-cli-shim-pattern.md`.
 
+Repo: `github.com/SvenDowideit/caddy-host-dns` (this repo), Apache-2.0.
+
+---
+
 ## 1. Motivation
 
-The home-network OTel plan needs global DNS names for a heterogeneous fleet,
-under a dedicated sub-zone (`otel.fi.gy`), and it needs Caddy to hold a valid
-certificate for those names **before** it can serve or issue anything for them.
+The home-network OTel plan needs global DNS names for a heterogeneous fleet under a
+dedicated sub-zone (`otel.fi.gy`), and Caddy needs a valid certificate for those names
+before it can serve them.
 
-Today `@svendowideit/caddy` covers TLS via ACME **DNS-01**, using a
-`github.com/caddy-dns/<provider>` module compiled into the binary. That path
-only ever writes **TXT** challenge records, ephemeral and self-managed by ACME.
+Two existing mechanisms fall short:
 
-`github.com/mholt/caddy-dynamicdns` does write **A/AAAA**, but it is a *dynamic
-DNS* app: it discovers the machine's IP from an IP-source (public HTTP / UPnP /
-interface) and reconciles whatever it finds. There is no way to say "the record
-for `x1yoga.otel.fi.gy` is **this fixed address**". For a home fleet with DHCP
-reservations and fixed internal addresses, that is the wrong control model.
+- **ACME DNS-01** (`github.com/caddy-dns/<provider>`) only writes ephemeral **TXT**
+  challenge records, self-managed by ACME. It cannot hold a fixed **A/AAAA/CNAME**.
+- **`github.com/mholt/caddy-dynamicdns`** writes A/AAAA, but it is a *dynamic DNS* app:
+  it discovers the machine's IP from an IP source (public HTTP / UPnP / interface) and
+  reconciles whatever it finds. There is no way to declare "the record for
+  `x1yoga.otel.fi.gy` is **this fixed address**". For a fleet with DHCP reservations and
+  fixed internal addresses, that is the wrong control model.
 
 ### 1.1 What we want
 
 A **static** DNS record app for Caddy:
 
-- one or more records, each explicitly configured with its name, type, and
-  **literal value(s)**;
-- supported types: **`A`**, **`AAAA`**, and **`CNAME`**;
-- the provider is **any `dns.providers.*` module already compiled into the
-  Caddy binary** — no per-provider code, no hard-coding, no new credential
-  handling;
-- records are reconciled idempotently on config load (desired → actual), so a
-  Caddy restart or `caddy reload` makes DNS match the declared config;
-- one credential location (the same provider module the TLS app already uses).
+- records explicitly configured with name, type, and **literal value(s)**;
+- supported types: **`A`**, **`AAAA`**, **`CNAME`**;
+- the provider is **any `dns.providers.*` module already compiled into the Caddy
+  binary** — no per-provider code, no hard-coded credentials;
+- records reconciled idempotently on `Provision`/`Start` and on `caddy reload`
+  (desired → actual), so config is the source of truth;
+- one credential location (the same provider module the TLS app already uses);
+- a **provider-agnostic test suite** so any user can prove their provider + API settings
+  + domain work, or get a clear report of what did not.
 
-### 1.2 Relationship to existing work
+### 1.2 Relationship to `caddy-dynamicdns`
 
-This is deliberately a **simplified, non-dynamic reimplementation of
-`caddy-dynamicdns`**: same provider-module integration and record-reconciliation
-idea, but the IP/value is **configured**, not discovered, and there is no
-timer, no IP sources, and no dynamic-domains scanning.
+Deliberately a **simplified, non-dynamic reimplementation**: same provider-module
+integration, same multi-provider normalization and Caddyfile parsing patterns, same
+record-reconciliation idea — but the value is **configured**, not discovered, and there
+is no timer, no IP sources, and no dynamic-domains scanning.
 
-It is **not** a fork of `caddy-dynamicdns` and does **not** use
-`dynamic_dns.ip_sources`. It is a new, small Caddy app module, contributed either
-upstream (to Caddy) or to our own repo, and compiled into the binary via the
-existing `@svendowideit/caddy` `plugins` mechanism.
+We **port** (not depend on) the following proven patterns from `caddy-dynamicdns`:
+`normalizeProviders`, `Provider` with per-provider reserved `record`/`remove` blocks,
+`splitProviderSegment`, `unmarshalModuleTokens`, and the Caddyfile parse-test approach.
+
+It is **not** a fork and does **not** use `dynamic_dns.ip_sources`. It is a new, small
+Caddy app module in this repo, compiled into Caddy via `xcaddy` / the download page.
+
+---
 
 ## 2. Non-goals
 
 - No public-IP discovery, UPnP, HTTP IP lookups, or interface scanning.
 - No background polling / `check_interval`. Reconciliation happens on
-  `Provision`/`Start` and on `caddy reload`.
+  `Provision`/`Start` and on reload.
 - No dynamic-domains scanning of the HTTP app's route hosts.
 - No SRV / TXT / CAA / MX / NS support in v1 (only `A`, `AAAA`, `CNAME`).
 - No provider-specific credential schema. That is the provider module's job.
 - Not a replacement for ACME DNS-01; the two coexist (TXT vs A/AAAA/CNAME).
+- No in-Caddy test command. Caddy can't run provider tests against itself; testing is
+  external (see §6).
+
+---
 
 ## 3. Prior art (verified)
 
-- **`dns.providers.*` namespace** — `modules/caddytls/acmeissuer.go` (the
-  `dns` Caddyfile directive) and `caddy-dynamicdns` both load providers with
-  `ctx.LoadModule(x, "<field>")` against `namespace=dns.providers inline_key=name`.
-  Providers such as `caddy-dns/gandi` register as `dns.providers.gandi` and
-  satisfy a `libdns` interface.
-- **`libdns` interfaces** (`github.com/libdns/libdns`):
-  `RecordGetter` (`GetRecords`), `RecordAppender` (`AppendRecords`),
-  `RecordSetter` (`SetRecords`), `RecordDeleter` (`DeleteRecords`),
-  `ZoneLister` (`ListZones`).
-- **`libdns` record types**: `Address{Name, TTL, IP netip.Addr}` (A *or* AAAA,
-  chosen by `IP.Is6()`), `CNAME{Name, TTL, Target}`; each has `RR() RR`
-  (`RR{Name, TTL, Type, Data}`).
-- **Reconciliation semantics**: `libdns.RecordSetter.SetRecords(ctx, zone, recs)`
-  guarantees that for every `(name, type)` pair in the input, *only* those
-  records exist in the output — it appends, modifies, **or deletes** to match.
-  Providers implement append + delete in terms of it.
-- **`Record` name/zone conventions**: record names are relative to a zone
-  (`libdns.RelativeName` / `AbsoluteName`; `@` = zone apex).
+- **`dns.providers.*` namespace** — `dynamicdns.go` loads providers with
+  `ctx.LoadModule(&a.Providers[i], "DNSProviderRaw")` against
+  `namespace=dns.providers inline_key=name`, and asserts the result to
+  `libdns.RecordSetter`.
+- **`libdns` interfaces** (`github.com/libdns/libdns`): `RecordGetter` (`GetRecords`),
+  `RecordAppender` (`AppendRecords`), `RecordSetter` (`SetRecords`), `RecordDeleter`
+  (`DeleteRecords`), `ZoneLister` (`ListZones`). `ZoneLister` is optional.
+- **`libdns` record types**: `Address{Name, TTL, IP netip.Addr}` (A *or* AAAA, chosen by
+  `IP.Is6()`), `CNAME{Name, TTL, Target}`; each has `RR() RR`.
+- **Reconciliation semantics**: `libdns.RecordSetter.SetRecords(ctx, zone, recs)` defines
+  desired state — for every `(name, type)` pair in the input, *only* those records exist
+  after the call; it appends, modifies, or deletes as needed. Providers implement append
+  + delete in terms of it. `SetRecords` may be non-atomic; `libdns.AtomicErr` signals
+  atomic failure.
+- **Name/zone conventions**: record names are relative to a zone; use `libdns.RelativeName`
+  / `libdns.AbsoluteName`; `@` = zone apex; CNAME targets should have a trailing dot.
+- **CNAME caution** (libdns docs): using `SetRecords` to add a CNAME where non-DNSSEC
+  records exist may fail, violate DNS standards, or remove the other records. Document a
+  warning; acceptable for a dedicated managed sub-zone.
+- **Official conformance suite** (`github.com/libdns/libdns/libdnstest`): `TestSuite`
+  wraps a `Provider` (Getter+Appender+Setter+Deleter, optionally ZoneLister via
+  `WrapNoZoneLister`), and `RunTests(t)` exercises `ListZones`, `GetRecords`,
+  `AppendRecords`, `SetRecords`, `DeleteRecords`, with automatic `test-*` cleanup,
+  `SkipRRTypes`, and `ExpectEmptyZone`. It operates on a **live provider object in the
+  test process**, so the provider module must be compiled into the test binary.
+- **`xcaddy`** builds Caddy with plugins:
+  `xcaddy build --with github.com/... --with github.com/caddy-dns/<provider>`.
+- **`caddytest`** (`caddyserver/caddy/caddytest`) runs an in-process Caddy and POSTs
+  configs to the admin API. It is used inside Caddy's own repo; it drives a real Caddy
+  and cannot reach a provider that lives in a different process/container.
 
-## 4. Design
+---
 
-### 4.1 Module identity
+## 4. Module design
+
+### 4.1 Identity
 
 | Field | Value |
 | --- | --- |
 | JSON app name | `dns_records` |
 | Go module ID | `dns_records` |
 | Caddyfile global option | `dns_records` |
-| Package | e.g. `github.com/<owner>/caddy-dnsrec` (or upstreamed) |
+| Go package | `github.com/SvenDowideit/caddy-host-dns/dnsrec` |
+| License | Apache-2.0 |
 
 Register in `init()` with `caddy.RegisterModule(App{})` and
 `httpcaddyfile.RegisterGlobalOption("dns_records", parseApp)`, exactly as
@@ -95,24 +123,64 @@ Register in `init()` with `caddy.RegisterModule(App{})` and
 
 ### 4.2 Config schema
 
+Multi-provider (preferred). Each provider owns its records; there is no shared record
+list because values are explicit.
+
 Caddyfile (global option):
 
 ```
 {
 	dns_records {
-		provider gandi {env.GANDI_BEARER_TOKEN}
+		provider gandi {env.GANDI_TOKEN} {
+			record otel.fi.gy    A     10.10.0.5
+			record otlp.fi.gy    A     10.10.0.6
+			record gateway.fi.gy CNAME otel.fi.gy.
+			record obs.fi.gy     A     10.10.0.7 ttl 5m
+			# explicit removal, applied on every reconcile:
+			# remove stale.fi.gy  A                    # all values of stale.fi.gy/A
+			# remove stale2.fi.gy A 10.10.0.99        # only that value
+		}
+		provider cloudflare {env.CF_API_TOKEN} {
+			record example.com @  A     203.0.113.10
+		}
+		ttl 1h
+		# optional:
+		# best_effort
+	}
+}
+```
 
-		record otel.fi.gy         A     10.10.0.5
-		record otlp.fi.gy         A     10.10.0.6
-		record gateway.fi.gy      CNAME otel.fi.gy.
+Legacy single-provider shorthand (top-level `provider` + `record`, no per-provider
+block) is folded into the providers list by `normalizeProviders`:
 
-		# per-record TTL override (else global / provider default)
-		record obs.otel.fi.gy     A     10.10.0.7 ttl 5m
-
+```
+{
+	dns_records {
+		provider gandi {env.GANDI_TOKEN}
+		record otel.fi.gy A 10.10.0.5
 		ttl 1h
 	}
 }
 ```
+
+Record syntax: `record <name> <type> <value...> [ttl <duration>]`
+
+- `<name>` is the **fully-qualified** record name (e.g. `otel.fi.gy`).
+- `<type>` ∈ `A`, `AAAA`, `CNAME`.
+- `<value...>` one or more values (A/AAAA: IPs; CNAME: exactly one hostname).
+- optional per-record `ttl`; an optional `zone` field exists in JSON only (derived at
+  Provision if omitted — see §4.4).
+
+Removal syntax: `remove <name> <type> [value...]`
+
+- With values: delete exactly those `(name,type,value)` records.
+- Without values: delete **all** records of that `(name,type)` RRset.
+- Applied on every reconcile via `DeleteRecords`; purely declarative (no memory of prior
+  config). Removal is the explicit, opt-in counterpart to `record` create/update.
+
+Inside a provider's block, the names `record` and `remove` are reserved for this app;
+everything else belongs to the DNS provider module (whether inline args or block
+subdirectives), same as `domains` in `caddy-dynamicdns`.
 
 Equivalent JSON:
 
@@ -120,14 +188,14 @@ Equivalent JSON:
 {
   "apps": {
     "dns_records": {
-      "dns_provider": {
-        "name": "gandi",
-        "bearer_token": "{env.GANDI_BEARER_TOKEN}"
-      },
-      "records": [
-        { "name": "otel.fi.gy",  "type": "A",     "zone": "fi.gy", "value": ["10.10.0.5"] },
-        { "name": "otlp.fi.gy",  "type": "A",     "zone": "fi.gy", "value": ["10.10.0.6"] },
-        { "name": "gateway.fi.gy","type": "CNAME", "zone": "fi.gy", "value": ["otel.fi.gy."] }
+      "providers": [
+        {
+          "dns_provider": { "name": "gandi", "token": "{env.GANDI_TOKEN}" },
+          "records": [
+            { "name": "otel.fi.gy", "type": "A", "value": ["10.10.0.5"] },
+            { "name": "gateway.fi.gy", "type": "CNAME", "value": ["otel.fi.gy."] }
+          ]
+        }
       ],
       "ttl": "1h"
     }
@@ -138,171 +206,309 @@ Equivalent JSON:
 ### 4.3 Go types
 
 ```go
+package dnsrec
+
 type App struct {
-    // Any module registered in namespace "dns.providers".
-    DNSProviderRaw json.RawMessage `json:"dns_provider,omitempty" caddy:"namespace=dns.providers inline_key=name"`
+	// Any module registered in namespace "dns.providers".
+	// Legacy single-provider shorthand; folded into Providers by normalizeProviders.
+	DNSProviderRaw json.RawMessage `json:"dns_provider,omitempty" caddy:"namespace=dns.providers inline_key=name"`
+	Records        []RecordSpec    `json:"records,omitempty"`
 
-    // Static records to reconcile.
-    Records []RecordSpec `json:"records,omitempty"`
+	// One entry per provider (or per account of the same provider).
+	Providers []Provider `json:"providers,omitempty"`
 
-    // Default TTL applied when a record omits its own. Optional.
-    TTL caddy.Duration `json:"ttl,omitempty"`
+	// Default TTL applied when a record omits its own. Optional.
+	TTL caddy.Duration `json:"ttl,omitempty"`
 
-    dnsProvider libdns.RecordSetter
-    logger      *zap.Logger
+	// Downgrade reconcile failures to logged errors instead of failing Start. Optional.
+	BestEffort bool `json:"best_effort,omitempty"`
+
+	ctx    caddy.Context
+	logger *zap.Logger
+}
+
+type Provider struct {
+	DNSProviderRaw json.RawMessage `json:"dns_provider,omitempty" caddy:"namespace=dns.providers inline_key=name"`
+	Records        []RecordSpec    `json:"records,omitempty"`
+	// Explicit removals; applied every reconcile.
+	Removals []RemoveSpec `json:"remove,omitempty"`
+
+	dnsProvider libdns.RecordSetter
 }
 
 type RecordSpec struct {
-    // FQDN of the record (fully qualified; not relative to the zone).
-    Name  string `json:"name,omitempty"`
+	// FQDN of the record (fully qualified; not relative to the zone).
+	Name string `json:"name,omitempty"`
 
-    // "A", "AAAA", or "CNAME".
-    Type  string `json:"type,omitempty"`
+	// "A", "AAAA", or "CNAME".
+	Type string `json:"type,omitempty"`
 
-    // Zone the record belongs to (e.g. "fi.gy"). Optional; if empty, derived
-    // from Name by longest-suffix match against libdns.ZoneLister, else an error.
-    Zone  string `json:"zone,omitempty"`
+	// Zone the record belongs to (e.g. "fi.gy"). Optional; if empty, derived at
+	// Provision from Name by longest-suffix match against ZoneLister.
+	Zone string `json:"zone,omitempty"`
 
-    // One or more values: IP literals for A/AAAA, a single hostname for CNAME.
-    Value []string `json:"value,omitempty"`
+	// A/AAAA: one or more IPs; CNAME: exactly one hostname.
+	Value []string `json:"value,omitempty"`
 
-    // Optional per-record TTL override.
-    TTL caddy.Duration `json:"ttl,omitempty"`
+	// Optional per-record TTL override.
+	TTL caddy.Duration `json:"ttl,omitempty"`
+}
+
+type RemoveSpec struct {
+	Name  string   `json:"name,omitempty"`
+	Type  string   `json:"type,omitempty"`
+	Zone  string   `json:"zone,omitempty"`
+	Value []string `json:"value,omitempty"` // empty => remove whole (name,type) RRset
 }
 ```
 
 ### 4.4 Lifecycle
 
 1. **`Provision(ctx)`**
-   - `ctx.LoadModule(a, "DNSProviderRaw")` → assert `libdns.RecordSetter`.
-     If the configured provider cannot set records, fail with a clear error.
+   - `ctx.Logger`, `normalizeProviders`.
+   - For each provider: `ctx.LoadModule(&p, "DNSProviderRaw")` → assert
+     `libdns.RecordSetter`; clear error if the provider cannot set records.
    - Validate every `RecordSpec`:
      - type ∈ {`A`,`AAAA`,`CNAME`};
-     - `A`/`AAAA`: every value parses via `netip.ParseAddr` and **matches the
-       record type** (`A`⇒IPv4, `AAAA`⇒IPv6) — reject mismatches rather than
-       silently emitting the wrong RR type;
+     - `A`: every value parses via `netip.ParseAddr` and is IPv4;
+     - `AAAA`: every value parses and is IPv6;
      - `CNAME`: exactly one value, a hostname (not an IP);
-     - `Name` and `Zone` both non-empty after resolution.
-   - Resolve `Zone` if omitted: if the provider implements `libdns.ZoneLister`,
-     pick the longest zone from `ListZones()` that is a suffix of `Name`;
-     otherwise require the operator to set `Zone` explicitly.
-   - Apply TTL: record `TTL` → app `TTL` → `0` (provider default).
+     - `Name` non-empty;
+   - Validate every `RemoveSpec` the same way, except values are optional.
+   - Resolve `Zone` per record/removal: explicit → else, if the provider implements
+     `libdns.ZoneLister`, pick the longest zone from `ListZones()` that is a suffix of
+     `Name` → else error telling the operator to set `zone`.
+   - Apply TTL precedence: record `TTL` → app `TTL` → `0` (provider default).
 
-2. **`Start()`** — one immediate reconcile pass, then return. No goroutine, no
-   ticker. (`caddy-dynamicdns` polls; we deliberately do not.)
+2. **`Start()`** — one immediate reconcile pass, then return. No goroutine, no ticker.
+   On reconcile error: log + return error unless `BestEffort`, in which case log only.
 
 3. **`Stop()`** — no-op.
 
-Reconcile pass, grouped by `(zone, type)`:
+Reconcile pass, grouped by `zone`:
 
 - Build `[]libdns.Record`:
-  - `A`/`AAAA` → one `libdns.Address` per value (`Name` relative to zone,
-    `TTL`, `IP`);
+  - `A`/`AAAA` → one `libdns.Address` per value (`Name` made relative to zone via
+    `libdns.RelativeName`, `TTL`, `IP`);
   - `CNAME` → one `libdns.CNAME` (`Name`, `TTL`, `Target`).
-- Call `dnsProvider.SetRecords(ctx, zone, recs)` once per zone.
-  `SetRecords` is the desired-state operation: it creates missing records,
-  updates changed ones, and removes stale ones in that `(name, type)` RRset.
-- Log a compact summary. On error, log and (see §4.6) fail unless
-  `best_effort` is set.
+- If any removals exist, assert the provider implements `libdns.RecordDeleter` (all real
+  providers do); build `[]libdns.Record` for the removals, with empty `Data` when no value
+  is given (libdns semantics: empty value matches all values of that `(name,type)`).
+- Call `p.dnsProvider.SetRecords(ctx, zone, recs)` once per zone (creates/updates; owns
+  each declared `(name,type)` RRset). Then call `DeleteRecords(ctx, zone, removals)` for
+  the explicit removals. Log a compact summary.
+- On error: log and fail unless `BestEffort`.
 
-### 4.5 Idempotency
+### 4.5 Idempotency, ownership & drift
 
-Because `SetRecords` is defined as "for each `(name, type)` in the input, these
-are the only members of the RRset after the call", re-running on every reload
-converges and prunes drift. This satisfies the plan's "declarative and
-idempotent; drift is reported, not feared" principle. A dry-run/plan mode may
-be added later (see §7).
+- **Declared `(name,type)` is owned.** `SetRecords` replaces that RRset with exactly the
+  declared values, so re-running converges, updates changed values, and prunes extra
+  values at a declared name/type. Nothing else in the zone is touched.
+- **Undeclared names persist.** Records whose names were removed from config are not
+  deleted automatically — `SetRecords` only receives currently-declared names. This is
+  the "only remove when explicitly required" rule.
+- **Explicit removal** is the `remove` directive; it is re-applied every reconcile, so it
+  is declarative and idempotent (`DeleteRecords` silently ignores already-absent records).
+- Optional future safety: a whole-zone authoritative mode is deliberately **not** in v1
+  (see §10).
 
 ### 4.6 Error handling
 
 - Config/validation errors fail `Provision` (Caddy refuses the config).
-- Runtime API errors during `Start`: by default **fail reload** so a typo can
-  never silently leave DNS wrong. An optional `best_effort` flag downgrades a
-  reconcile failure to a logged error (useful if the provider API is flaky at
-  boot and a later reload will retry).
+- Runtime API errors during `Start` fail the load/reload by default, so a typo cannot
+  silently leave DNS wrong. `best_effort` downgrades a reconcile failure to a logged
+  error.
 
-## 5. Provider-agnosticism (explicit)
+### 4.7 Provider-agnosticism (explicit)
 
-- The app **never** names a provider, a credential field, or an env var in code.
-- `DNSProviderRaw` is a Caddy module reference; the operator's `provider`
-  directive (`provider gandi {env.GANDI_BEARER_TOKEN}`) is unmarshalled by
-  whatever `dns.providers.*` module is compiled in. If `github.com/caddy-dns/gandi`
-  is not compiled in, `ctx.LoadModule` fails with Caddy's normal
-  "module not registered" error — no special-casing.
-- Credentials live in the provider's own module config, placed there by the
-  caller. For our deployment that means the same `EnvironmentFile` +
-  `{env.*}` placeholder path `@svendowideit/caddy` already uses for DNS-01, so
-  there is exactly **one** credential location for a given provider.
+- The app **never** names a provider, credential field, or env var in code.
+- `DNSProviderRaw` is a Caddy module reference; `provider gandi {env.GANDI_TOKEN}` is
+  unmarshalled by whatever `dns.providers.gandi` module is compiled in. If absent,
+  `ctx.LoadModule` fails with Caddy's normal "module not registered" error.
+- Credentials live in the provider's own module config. For our deployment that is the
+  same `EnvironmentFile` + `{env.*}` path the image already uses for DNS-01, so there is
+  exactly **one** credential location per provider.
 
-## 6. Integration with `@svendowideit/caddy`
+---
 
-- Add a new global arg, e.g. `dnsRecords` (array of {name,type,value,zone,ttl}),
-  rendered into the JSON config as `apps.dns_records.records`, reusing the
-  existing `configureTls` provider/`providerConfig` machinery to emit
-  `apps.dns_records.dns_provider` (same env-var placeholders, same
-  `EnvironmentFile`).
-- Merge semantics: like routes, `dnsRecords` from multiple models merge on
-  `(name, type)`; a conflicting duplicate `(name,type)` with different values is
-  an error naming both models (mirrors `mergeDesired` for routes/listenAddrs).
-- Surface DNS record state in `audit`/`plan`: desired records (per model, then
-  merged), and — where the provider supports `RecordGetter` — the live records
-  for the zone, with `onlyDesired` / `onlyActual` / `inSync`, so `audit` keeps
-  being the one command that says what is going on.
-- The `dns_records` module must be added to the `plugins` list the model
-  compiles into the binary (alongside the `caddy-dns/*` provider). If we
-  upstream it, users add it as a normal plugin; if it stays in our repo, the
-  model pins our module path.
+## 5. Integration with `@svendowideit/caddy` (out of scope)
 
-## 7. Testing
+Deliberately **out of scope** for this plan. Once the module exists and is published, a
+follow-up doc will cover: a `dnsRecords` model arg rendering `apps.dns_records.records`,
+reuse of `configureTls` provider machinery for `dns_provider`, merge semantics on
+`(name,type)`, `audit`/`plan` surfacing of desired vs live records, and pinning the
+module in the image's `plugins` list. Recorded here so it is not lost.
 
-- **Unit (Go)** with a fake `libdns.RecordSetter` / `ZoneLister`:
-  - A/AAAA/CNAME → correct `libdns` record construction (relative names, types
-    chosen by IP family, TTL precedence);
-  - validation rejects: unknown type, IP/type mismatch, CNAME with 0 or >1
-    values, CNAME target that is an IP, un-resolvable zone;
+---
+
+## 6. Testing
+
+Testing is external to Caddy. Two layers ship now; a third (containerized black-box E2E)
+is designed but **deferred**.
+
+### 6.1 Unit + Caddyfile parse (Go, in this repo)
+
+- Fake `libdns.RecordSetter` / `RecordGetter` / `RecordDeleter` / `ZoneLister`:
+  - A/AAAA/CNAME → correct `libdns` construction (relative names, type chosen by IP
+    family, TTL precedence);
+  - validation rejects: unknown type, IP/type mismatch, CNAME with 0 or >1 values,
+    CNAME target that is an IP, unresolved zone;
   - reconcile calls `SetRecords` once per zone with the expected records;
+  - `remove` builds the expected delete records, including empty-value (whole RRset) and
+    explicit-value forms, and calls `DeleteRecords`;
   - `best_effort` on/off changes whether a provider error fails `Start`.
-- **Caddyfile parse test** mirroring `caddyfile_test.go` in
-  `caddy-dynamicdns` (parse → JSON shape).
-- **Integration (opt-in, real provider)**: set one record in a scratch zone,
-  assert via `RecordGetter` (or `dig`), then set a changed value and assert the
-  old value is gone (proves `SetRecords` pruning).
-- **Live smoke**: `x1yoga.otel.fi.gy A <fixed IP>` via the existing gandi
-  token; `dig` confirms; `audit` reports `inSync`.
+- Caddyfile parse tests mirroring `caddyfile_test.go`: parse → JSON shape, including the
+  legacy single-provider fold, multiple providers with nested `record`/`remove` blocks,
+  and `remove` with/without values; a `dummyProvider` registered as
+  `dns.providers.test_dummy` proves reserved tokens never leak into the provider module.
 
-## 8. Phasing
+### 6.2 Provider conformance (`libdnstest`)
 
-- **v1**: global option, single provider, static `A`/`AAAA`/`CNAME`, provision +
-  start + `SetRecords`, validation, tests. This is the whole of §4.
-- **v1.1**: `best_effort`, per-record TTL, zone auto-resolution via `ZoneLister`.
-- **Deferred**: a `verify`/plan action (desired-vs-actual diff via
-  `RecordGetter`) so `audit` can show live drift; support for additional record
-  types (SRV/TXT/CAA) if the plan later needs them.
+Purpose: a user proves **their** provider + API settings + domain work, or gets a clear
+report of what did not.
 
-## 9. Consequences
+- New package `conformance` wrapping `github.com/libdns/libdns/libdnstest`:
+  - builds a provider from a JSON fragment (the same object that goes under
+    `dns_provider`) via a caller-supplied constructor, or from env vars;
+  - `Run(t)` calls `libdnstest.NewTestSuite(provider, zone).RunTests(t)`, with
+    `SkipRRTypes` defaulting to everything except A/AAAA/CNAME/TXT (our v1 scope plus the
+    mandatory framework types), `ExpectEmptyZone` on, and a 30s timeout.
+- Because providers must be compiled in, the user writes a tiny test file in a repo that
+  imports our `conformance` package **and** their provider:
+  ```go
+  //go:build conformance
 
-- Positive: fixed internal names are expressible and reconciled from declared
-  config, with **no new provider code** and no second credential store; the
-  same compiled-in `caddy-dns/*` module serves both TXT (ACME) and A/AAAA/CNAME.
-- Positive: eliminates the Go-CLI-shim path (§7.1b / ADR-0005) for the common
-  A/AAAA/CNAME case; that shim remains only for record ops Caddy still cannot
-  express (e.g. SRV), if ever needed.
-- Negative: a Caddy app module must be built and shipped/pinned; it must track
-  `libdns` API changes. Mitigated by small surface (3 record types) and upstream
-  option.
+  package conformance_test
 
-## 10. Open questions
+  import (
+      "testing"
+      "github.com/SvenDowideit/caddy-host-dns/conformance"
+      _ "github.com/caddy-dns/cloudflare"
+  )
 
-1. **Home**: upstream to Caddy (broadest value, review latency) vs. our own
-   module repo now (faster, then upstream later)? This determines the `plugins`
-   entry and whether `@svendowideit/caddy` must pin a module path.
-2. **Deletion policy**: `SetRecords` prunes *all* records for a `(name,type)` in
-   the zone that are not declared. For a managed sub-zone that is correct; if the
-   app is ever pointed at a zone with hand-managed records of the same name/type,
-   it will delete them. Do we want an `update_only` guard (like
-   `caddy-dynamicdns`) that only sets existing records and never creates?
-3. **Zone default**: require explicit `Zone` in v1 (simplest, unambiguous) and
-   add `ZoneLister` derivation in v1.1? Or derive from the start?
-4. **CNAME at apex / coexistence**: `SetRecords` with CNAME will remove other
-   non-DNSSEC records at that name (per `libdns` docs). Acceptable for our
-   dedicated sub-zone, but should we document a hard warning?
+  func TestMyProvider(t *testing.T) {
+      conformance.RunFromEnv(t) // CONFORMANCE_PROVIDER_JSON, CONFORMANCE_ZONE
+  }
+  ```
+- We ship a worked example (`conformance/example/powerdns_test.go`) using
+  `github.com/caddy-dns/powerdns`, and docs describing the safe pattern: **use a
+  dedicated test zone/domain**; the suite writes and deletes `test-*` records.
+- Synthetic/local backend aid: a plain `docker-compose.yml` running PowerDNS auth
+  (`powerdns/pdns-auth-49`, API on `:8081`, key `secret`, matching libdns/powerdns) so a
+  developer can point the conformance test at `http://localhost:8081` and a locally
+  seeded zone. No orchestration code — start it with `docker compose up -d`, run
+  `go test -tags conformance`. Real-provider runs use the same test with real provider
+  JSON + zone.
+- CI guard: an always-on conformance **smoke** against `libdns/libdns/libdnstest/example`
+  (in-memory provider) proves our wrapper runs the suite correctly, without live creds.
+
+### 6.3 CI
+
+- GitHub Actions: `go build ./...`, `go vet ./...`, `go test ./...` (unit + parse),
+  `go test -tags conformance ./conformance/...` (in-memory example smoke), `gofmt` check,
+  and an `xcaddy build` step adding `dns_records` + `caddy-dns/powerdns` to prove the
+  module compiles into a real Caddy.
+- Real-provider conformance is never run in CI (needs secrets); documented as a local,
+  opt-in command.
+
+### 6.4 Deferred: containerized black-box Caddy+PowerDNS E2E
+
+Designed, decision-open, **not built now**. Rationale: it validates the module through
+its real Caddyfile/JSON entry point, which unit tests cannot, but needs orchestration we
+have not chosen.
+
+Researched shape (for later):
+
+- **Image**: `Dockerfile` using a build arg,
+  `xcaddy build --with github.com/SvenDowideit/caddy-host-dns --with github.com/caddy-dns/<provider>`,
+  so any user/provider gets a tested binary from one recipe.
+- **Two containers**: `caddy` (the module under test) and `powerdns` (auth + API), on a
+  shared compose network; a throwaway `dig`/tools sidecar for verification, plus
+  `docker exec` into the Caddy container to inspect `/config/` and logs.
+- **Generated configs**: harnesses create Caddyfiles using `dns_records { provider
+  powerdns {env.PDNS_SERVER_URL} {env.PDNS_TOKEN} record ... }`, seed a synthetic zone,
+  then assert via `dig` and `docker exec`: A/AAAA/CNAME create; idempotent reload;
+  prune on value change; multi-record A; validation error fails config; auth error is
+  reported clearly; TTL applied; optional zone auto-detect.
+- **Real provider**: same harness with real provider JSON fragment + real zone + creds
+  from env/file; synthetic record names under the real zone, cleaned up.
+- **Open decision**: Go tests orchestrating `testcontainers-go`, vs `Makefile`+`docker
+  compose`, vs a small standalone runner. To be decided when we build it.
+
+---
+
+## 7. Repository layout
+
+```
+caddy-host-dns/
+  go.mod                              # github.com/SvenDowideit/caddy-host-dns
+  LICENSE                             # Apache-2.0
+  README.md
+  caddy-dns-records-module.md         # this plan
+  dnsrec/
+    app.go                            # App, Provider, RecordSpec, RemoveSpec, lifecycle, reconcile
+    caddyfile.go                      # parseApp, parseRecords, normalizeProviders,
+                                      #   splitProviderSegment, unmarshalModuleTokens
+    records.go                        # validation, zone resolution, libdns construction
+    app_test.go                       # unit tests with fake provider
+    caddyfile_test.go                 # parse tests (dummy provider)
+  conformance/
+    conformance.go                    # libdnstest wrapper + env config
+    example/
+      powerdns_test.go                # worked example (build-tagged)
+  docker-compose.yml                  # PowerDNS aid for local conformance
+  .github/workflows/ci.yml
+  e2e/                                # DEFERRED (placeholder + design notes)
+```
+
+---
+
+## 8. Implementation steps
+
+1. Scaffold repo: `go.mod` (`module github.com/SvenDowideit/caddy-host-dns`, Go 1.24+),
+   `LICENSE`, `README.md`, `.gitignore`.
+2. `dnsrec/app.go`: types, `CaddyModule`, interface guards, `Provision`/`Start`/`Stop`.
+3. `dnsrec/records.go`: validation, TTL precedence, zone resolution, `libdns` construction.
+4. `dnsrec/caddyfile.go`: `parseApp`, `parseRecords`, `parseRemovals`,
+   `normalizeProviders`, `splitProviderSegment`, `unmarshalModuleTokens`.
+5. `dnsrec/*_test.go`: fake provider + dummy provider; table tests mirroring
+   `caddy-dynamicdns`.
+6. `conformance/`: `libdnstest` wrapper, env-config, example `powerdns_test.go`.
+7. `docker-compose.yml`: PowerDNS auth + API config for local conformance.
+8. `.github/workflows/ci.yml`: build, vet, test, conformance smoke, `xcaddy build`.
+9. `README.md`: config examples, provider-agnostic statement, conformance how-to
+   (dedicated test zone warning), local PowerDNS instructions.
+10. Update this file's status to "implemented" and add a "deferred E2E" tracking issue.
+
+---
+
+## 9. Phasing
+
+- **v1 (this plan)**: module (§4) including `record` create/update and `remove` deletion,
+  unit + parse tests (§6.1), provider conformance via `libdnstest` (§6.2), CI (§6.3),
+  PowerDNS compose aid.
+- **v1.1**: per-provider default zone, clearer provider-capability errors, optional
+  whole-zone authoritative mode (see §10).
+- **Deferred**: containerized black-box E2E (§6.4); `@svendowideit/caddy` integration
+  (§5); additional record types (SRV/TXT/CAA) if a later need arises.
+
+---
+
+## 10. Decisions taken
+
+1. **Conformance record scope**: TXT/A/CNAME are always tested by `libdnstest`; TXT is
+   accepted (it proves the provider's generic capability even though the module manages
+   only A/AAAA/CNAME). Other types are skipped via `SkipRRTypes`.
+2. **Zone requirement**: explicit `zone` wins; otherwise derive via `ZoneLister` at
+   Provision; otherwise fail with a clear error telling the operator to set `zone`.
+3. **`update_only`**: dropped. The module's purpose is to create/update records; the
+   owned-RRset `SetRecords` primitive already does create+update. Automatic removal of
+   undeclared names is deliberately absent.
+4. **Removal**: explicit `remove` directive in v1 (whole `(name,type)` RRset, or specific
+   values), re-applied every reconcile via `DeleteRecords`. A future whole-zone
+   authoritative mode remains possible (v1.1).
+5. **Dry-run/plan**: dropped. It does not help creation and the fail-loud reconcile plus
+   explicit `remove` cover the safety need.
+6. **Conformance packaging**: a package inside this module (not a separate module).
+7. **Upstream path**: commit now to `github.com/SvenDowideit/caddy-host-dns`; optionally
+   offer upstream later behind a re-export if accepted.
