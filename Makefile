@@ -241,17 +241,13 @@ e2e: ## Run the containerized BIND e2e (builds Caddy via xcaddy in a container)
 e2e-build: ## Build e2e/bin/caddy only (reusing host Go caches)
 	E2E_PROVIDER=$(E2E_PROVIDER) ./e2e/build-caddy.sh
 
-.PHONY: e2e-download
-e2e-download: ## Download Caddy from caddyserver.com/download into e2e/bin/caddy
-	@curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64&p=$(MODULE)&p=$(E2E_PROVIDER)" -o e2e/bin/caddy || { \
-		echo; \
-		echo "Download failed. The caddyserver.com build service only builds module"; \
-		echo "paths in its registry (https://caddyserver.com/api/packages). Until"; \
-		echo "$(MODULE) is registered, use 'make e2e' (xcaddy) instead."; \
-		exit 1; \
-	}
-	chmod +x e2e/bin/caddy
+.PHONY: e2e-caddyserver
+e2e-caddyserver: ## Run the e2e with a Caddy downloaded from caddyserver.com/download
+	E2E_PROVIDER=$(E2E_PROVIDER) ./e2e/fetch-caddy.sh
 	E2E_SKIP_BUILD=1 E2E_PROVIDER=$(E2E_PROVIDER) ./e2e/run.sh
+
+.PHONY: e2e-download
+e2e-download: e2e-caddyserver ## Alias for e2e-caddyserver
 
 .PHONY: e2e-config
 e2e-config: ## Validate the e2e compose file
