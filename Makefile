@@ -260,3 +260,14 @@ e2e-down: ## Stop the e2e containers and network
 .PHONY: e2e-clean
 e2e-clean: ## Remove the e2e-built Caddy binary
 	rm -rf e2e/bin
+
+# --- registry scanner reproduction -----------------------------------------
+
+# Checks whether a package/module path is scannable by the Caddy module
+# registry (what https://caddyserver.com/account/register-package runs), by
+# reproducing its go get + packages.Load. A record of how the check is done.
+MODSCAN_PATH ?= $(MODULE)
+
+.PHONY: modscan
+modscan: ## Scan MODSCAN_PATH the way the Caddy registry does
+	cd tools/modscan && $(GO) run . $(MODSCAN_PATH)

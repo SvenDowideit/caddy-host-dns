@@ -6,3 +6,6 @@
 .env
 /.docker/bind/zones/
 /e2e/bin/
+
+# modscan build artifact
+/tools/modscan/modscan

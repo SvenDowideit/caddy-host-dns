@@ -459,9 +459,14 @@ private Docker network, and verifies through Caddy's own admin API and Caddyfile
   `bind`s the endpoint(s) its records point to, so per-endpoint HTTP responses prove
   the served addresses match DNS.
 - **Known limitation**: the hosted build service only builds module paths in its
-  registry (https://caddyserver.com/api/packages); the module must be registered at
-  https://caddyserver.com/account/register-package before `make e2e-download`
-  succeeds. The xcaddy path has no such restriction.
+  registry (https://caddyserver.com/api/packages). It keys on the Go **module**
+  path (the directory with go.mod/go.sum), not the package that calls
+  `RegisterModule`. Register/claim `github.com/SvenDowideit/caddy-host-dns`
+  (the module root, which blank-imports `dnsrec`), not the `.../dnsrec` package.
+  This mirrors `github.com/mholt/caddy-l4` and `github.com/ubiuser/caddy-geo-ops`,
+  which register at their module root while their modules live in subpackages.
+  Until registered, `make e2e-caddyserver` fails clearly; `make e2e` (xcaddy) has
+  no such restriction.
 
 ---
 
