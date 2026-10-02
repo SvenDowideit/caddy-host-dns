@@ -269,5 +269,9 @@ e2e-clean: ## Remove the e2e-built Caddy binary
 MODSCAN_PATH ?= $(MODULE)
 
 .PHONY: modscan
-modscan: ## Scan MODSCAN_PATH the way the Caddy registry does
+modscan: ## Scan MODSCAN_PATH the way the Caddy registry does (via the module proxy)
 	cd tools/modscan && $(GO) run . $(MODSCAN_PATH)
+
+.PHONY: modscan-noproxy
+modscan-noproxy: ## Like modscan, but fetch MODSCAN_PATH directly (bypass proxy's cached @latest)
+	cd tools/modscan && $(GO) run . -private $(MODSCAN_PATH)

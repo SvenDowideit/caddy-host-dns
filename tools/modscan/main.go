@@ -30,15 +30,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"golang.org/x/tools/go/packages"
 )
 
 func main() {
 	keep := flag.Bool("keep", false, "keep the temporary workspace")
+	private := flag.Bool("private", false, "fetch the module under test directly (bypass the Go module proxy's cached @latest); useful right after pushing a commit")
 	flag.Parse()
 	if flag.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: modscan <package-or-module-path>")
+		fmt.Fprintln(os.Stderr, "usage: modscan [-private] <package-or-module-path>")
 		os.Exit(2)
 	}
 	pattern := flag.Arg(0)
@@ -58,11 +60,27 @@ func main() {
 		fatal("writing workspace go.mod: %v", err)
 	}
 
-	fmt.Printf("workspace: %s\npattern:   %s\n\n", dir, pattern)
+	fmt.Printf("workspace: %s\npattern:   %s\n", dir, pattern)
+
+	env := append(os.Environ(), "GOFLAGS=-mod=mod")
+	if *private {
+		// The Go module proxy caches @latest, so a just-pushed commit can
+		// resolve to an old revision. GOPRIVATE forces the module under test
+		// to be fetched directly (fresh), while its dependencies still come
+		// from the proxy.
+		prefix := repoPrefix(pattern)
+		if prefix == "" {
+			fatal("cannot derive a repo prefix from %q for -private", pattern)
+		}
+		env = append(env, "GOPRIVATE="+prefix, "GONOSUMDB="+prefix, "GONOSUMCHECK=1")
+		fmt.Printf("private:   %s (fresh/direct fetch for the module under test)\n", prefix)
+	}
+	fmt.Println()
 
 	fmt.Println("== go get", pattern)
 	get := exec.Command("go", "get", pattern)
 	get.Dir = dir
+	get.Env = env
 	get.Stdout = os.Stdout
 	get.Stderr = os.Stderr
 	if err := get.Run(); err != nil {
@@ -81,7 +99,7 @@ func main() {
 			packages.NeedTypesInfo,
 		// The registry forces this; without it, Linux fails with
 		// "could not import C (no metadata for C)".
-		Env: append(os.Environ(), "CGO_ENABLED=0"),
+		Env: append(env, "CGO_ENABLED=0"),
 	}
 
 	fmt.Println("== packages.Load", pattern)
@@ -205,6 +223,18 @@ func findRegistrations(pkgs []*packages.Package, keep map[string]bool) []string 
 		out = append(out, p)
 	}
 	return out
+}
+
+// repoPrefix returns "host/owner/repo" for a package path, which is the
+// GOPRIVATE pattern that makes the go command fetch that repo directly (fresh)
+// instead of through the module proxy's cache. Returns "" if the path is too
+// short to tell.
+func repoPrefix(path string) string {
+	parts := strings.Split(path, "/")
+	if len(parts) < 3 {
+		return ""
+	}
+	return strings.Join(parts[:3], "/")
 }
 
 func fatal(format string, args ...any) {
