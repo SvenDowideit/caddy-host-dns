@@ -43,7 +43,9 @@ type fakeProvider struct {
 	Live []libdns.Record
 
 	sets    []setCall
+	appends []setCall
 	deletes []deleteCall
+	ops     []string
 }
 
 type setCall struct {
@@ -88,6 +90,16 @@ func (p *fakeProvider) SetRecords(_ context.Context, zone string, recs []libdns.
 		return nil, errors.New("boom")
 	}
 	p.sets = append(p.sets, setCall{zone: zone, recs: recs})
+	p.ops = append(p.ops, "set")
+	return recs, nil
+}
+
+func (p *fakeProvider) AppendRecords(_ context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
+	if p.Fail {
+		return nil, errors.New("boom")
+	}
+	p.appends = append(p.appends, setCall{zone: zone, recs: recs})
+	p.ops = append(p.ops, "append")
 	return recs, nil
 }
 
@@ -103,6 +115,7 @@ func (p *fakeProvider) DeleteRecords(_ context.Context, zone string, recs []libd
 		return nil, errors.New("boom")
 	}
 	p.deletes = append(p.deletes, deleteCall{zone: zone, recs: recs})
+	p.ops = append(p.ops, "delete")
 	return recs, nil
 }
 
@@ -154,39 +167,46 @@ func Test_Provision_Reconcile(t *testing.T) {
 
 	fake := app.Providers[0].dnsProvider.(*fakeProvider)
 
-	if len(fake.sets) != 1 {
-		t.Fatalf("expected 1 SetRecords call, got %d", len(fake.sets))
+	// Fresh create appends the A/AAAA values and sets the CNAME; the stale
+	// removal below uses DeleteRecords.
+	if len(fake.appends) != 1 {
+		t.Fatalf("expected 1 AppendRecords call, got %d", len(fake.appends))
 	}
-	set := fake.sets[0]
-	if set.zone != "fi.gy." {
-		t.Errorf("set zone = %q, want fi.gy.", set.zone)
+	if len(fake.sets) != 1 {
+		t.Fatalf("expected 1 SetRecords call (CNAME), got %d", len(fake.sets))
+	}
+	if set := fake.appends[0]; set.zone != "fi.gy." {
+		t.Errorf("append zone = %q, want fi.gy.", set.zone)
 	}
 
-	addr, ok := set.recs[0].(libdns.Address)
-	if !ok {
-		t.Fatalf("record 0 = %T, want libdns.Address", set.recs[0])
+	var appended []libdns.Record
+	for _, call := range fake.appends {
+		appended = append(appended, call.recs...)
 	}
-	if addr.Name != "otel" || addr.TTL != time.Hour {
-		t.Errorf("otel: name=%q ttl=%v, want otel / 1h", addr.Name, addr.TTL)
+	for _, call := range fake.sets {
+		appended = append(appended, call.recs...)
 	}
-	if addr.IP.String() != "10.10.0.5" {
-		t.Errorf("otel ip = %s", addr.IP)
+	byKey := make(map[string]libdns.RR, len(appended))
+	for _, rec := range appended {
+		rr := rec.RR()
+		byKey[rr.Name+"/"+rr.Type+"/"+rr.Data] = rr
 	}
-	addr2 := set.recs[1].(libdns.Address)
-	if addr2.IP.String() != "10.10.0.6" {
-		t.Errorf("otel second ip = %s", addr2.IP)
+
+	otel5 := byKey["otel/A/10.10.0.5"]
+	if otel5.TTL != time.Hour {
+		t.Errorf("otel ttl = %v, want 1h", otel5.TTL)
 	}
-	obs := set.recs[2].(libdns.Address)
-	if obs.TTL != 5*time.Minute {
+	if _, ok := byKey["otel/A/10.10.0.6"]; !ok {
+		t.Errorf("missing otel 10.10.0.6; have %v", byKey)
+	}
+	if obs := byKey["obs/A/10.10.0.7"]; obs.TTL != 5*time.Minute {
 		t.Errorf("obs ttl = %v, want 5m (per-record override)", obs.TTL)
 	}
-	v6 := set.recs[3].(libdns.Address)
-	if v6.RR().Type != "AAAA" || v6.IP.String() != "2001:db8::1" {
-		t.Errorf("v6 = %+v", v6)
+	if _, ok := byKey["v6/AAAA/2001:db8::1"]; !ok {
+		t.Errorf("missing v6 AAAA; have %v", byKey)
 	}
-	cname := set.recs[4].(libdns.CNAME)
-	if cname.Name != "gateway" || cname.Target != "otel.fi.gy." {
-		t.Errorf("cname = %+v", cname)
+	if _, ok := byKey["gateway/CNAME/otel.fi.gy."]; !ok {
+		t.Errorf("missing gateway CNAME; have %v", byKey)
 	}
 
 	if len(fake.deletes) != 1 {
@@ -210,6 +230,142 @@ func Test_Provision_Reconcile(t *testing.T) {
 	rr2 := del.recs[2].RR()
 	if rr2.Name != "stale2" || rr2.Data != "10.10.0.99" {
 		t.Errorf("delete[2] = %+v, want name=stale2 data=10.10.0.99", rr2)
+	}
+}
+
+func Test_Reconcile_NoChangeSkipsProvider(t *testing.T) {
+	// The live zone already holds exactly the declared values, so a reload
+	// must not touch the provider at all.
+	app, err := provisionWith(t, `{
+		"providers": [{
+			"dns_provider": {"name": "test_fake", "zones": ["fi.gy."]},
+			"records": [
+				{"name": "otel.fi.gy", "type": "A", "value": ["10.10.0.5", "10.10.0.6"]},
+				{"name": "gateway.fi.gy", "type": "CNAME", "value": ["otel.fi.gy."]}
+			]
+		}],
+		"ttl": "1h"
+	}`)
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	fake := app.Providers[0].getter.(*fakeProvider)
+	fake.Live = []libdns.Record{
+		libdns.Address{Name: "otel", TTL: time.Hour, IP: netip.MustParseAddr("10.10.0.5")},
+		libdns.Address{Name: "otel", TTL: time.Hour, IP: netip.MustParseAddr("10.10.0.6")},
+		libdns.CNAME{Name: "gateway", TTL: time.Hour, Target: "otel.fi.gy."},
+	}
+	if err := app.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if len(fake.sets) != 0 || len(fake.appends) != 0 || len(fake.deletes) != 0 {
+		t.Fatalf("unchanged reconcile made provider calls: sets=%d appends=%d deletes=%d",
+			len(fake.sets), len(fake.appends), len(fake.deletes))
+	}
+}
+
+func Test_Reconcile_InPlaceChangeAppendsBeforeDelete(t *testing.T) {
+	// Changing an A value must append the new value before deleting the old
+	// one, so that a resolver never observes an empty RRset.
+	app, err := provisionWith(t, `{
+		"providers": [{
+			"dns_provider": {"name": "test_fake", "zones": ["fi.gy."]},
+			"records": [{"name": "otel.fi.gy", "type": "A", "value": ["10.10.0.6"]}]
+		}],
+		"ttl": "1h"
+	}`)
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	fake := app.Providers[0].getter.(*fakeProvider)
+	fake.Live = []libdns.Record{
+		libdns.Address{Name: "otel", TTL: time.Hour, IP: netip.MustParseAddr("10.10.0.5")},
+	}
+	if err := app.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if len(fake.sets) != 0 {
+		t.Fatalf("expected no SetRecords, got %d", len(fake.sets))
+	}
+	if len(fake.appends) != 1 {
+		t.Fatalf("expected 1 append, got %d", len(fake.appends))
+	}
+	if len(fake.deletes) != 1 {
+		t.Fatalf("expected 1 delete, got %d", len(fake.deletes))
+	}
+	want := []string{"append", "delete"}
+	if len(fake.ops) != 2 || fake.ops[0] != want[0] || fake.ops[1] != want[1] {
+		t.Fatalf("operation order = %v, want %v", fake.ops, want)
+	}
+	got := fake.appends[0].recs[0].RR()
+	if got.Data != "10.10.0.6" {
+		t.Errorf("appended %q, want 10.10.0.6", got.Data)
+	}
+	removed := fake.deletes[0].recs[0].RR()
+	if removed.Data != "10.10.0.5" {
+		t.Errorf("deleted %q, want 10.10.0.5", removed.Data)
+	}
+}
+
+func Test_Reconcile_CNAMEChangeUsesSetRecords(t *testing.T) {
+	// A CNAME can hold only one target, so it is replaced through SetRecords
+	// rather than a fragile delete-then-append pair.
+	app, err := provisionWith(t, `{
+		"providers": [{
+			"dns_provider": {"name": "test_fake", "zones": ["fi.gy."]},
+			"records": [{"name": "gw.fi.gy", "type": "CNAME", "value": ["new.fi.gy."]}]
+		}],
+		"ttl": "1h"
+	}`)
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	fake := app.Providers[0].getter.(*fakeProvider)
+	fake.Live = []libdns.Record{
+		libdns.CNAME{Name: "gw", TTL: time.Hour, Target: "old.fi.gy."},
+	}
+	if err := app.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if len(fake.sets) != 1 {
+		t.Fatalf("expected 1 SetRecords for CNAME, got %d", len(fake.sets))
+	}
+	if len(fake.appends) != 0 || len(fake.deletes) != 0 {
+		t.Fatalf("CNAME replace should not append/delete: appends=%d deletes=%d", len(fake.appends), len(fake.deletes))
+	}
+	if got := fake.sets[0].recs[0].RR().Data; got != "new.fi.gy." {
+		t.Errorf("CNAME target = %q, want new.fi.gy.", got)
+	}
+}
+
+func Test_Reconcile_TTLChangeAppendsWithoutDelete(t *testing.T) {
+	// A TTL-only change appends the desired value to refresh it, but must not
+	// delete the same value, which would briefly empty the RRset.
+	app, err := provisionWith(t, `{
+		"providers": [{
+			"dns_provider": {"name": "test_fake", "zones": ["fi.gy."]},
+			"records": [{"name": "otel.fi.gy", "type": "A", "value": ["10.10.0.5"]}]
+		}],
+		"ttl": "30m"
+	}`)
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	fake := app.Providers[0].getter.(*fakeProvider)
+	fake.Live = []libdns.Record{
+		libdns.Address{Name: "otel", TTL: time.Hour, IP: netip.MustParseAddr("10.10.0.5")},
+	}
+	if err := app.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if len(fake.appends) != 1 {
+		t.Fatalf("expected 1 append for changed TTL, got %d", len(fake.appends))
+	}
+	if len(fake.deletes) != 0 {
+		t.Fatalf("changed TTL must not delete the still-declared value, got %d deletes", len(fake.deletes))
+	}
+	if ttl := fake.appends[0].recs[0].RR().TTL; ttl != 30*time.Minute {
+		t.Errorf("appended ttl = %v, want 30m", ttl)
 	}
 }
 

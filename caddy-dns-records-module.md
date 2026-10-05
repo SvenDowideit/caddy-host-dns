@@ -318,13 +318,25 @@ Reconcile pass, grouped by `zone`:
 - Call `p.dnsProvider.SetRecords(ctx, zone, recs)` once per zone (creates/updates; owns
   each declared `(name,type)` RRset). Then `DeleteRecords(ctx, zone, resolved)`. Log a
   compact summary.
+- **In-place reconcile (default when the provider supports it).** Before touching the
+  provider, read the zone once (`GetRecords`) and compare each declared `(name,type)`
+  RRset with the live one. If every declared RRset already holds exactly the declared
+  values, do nothing — this guard stops a reload from needlessly delete/re-adding an
+  unchanged record. Otherwise, when the provider implements `RecordAppender` and
+  `RecordDeleter`, update in place: **append** new A/AAAA values first, then **delete**
+  stale values, so an RRset is never momentarily empty (which a resolver/router could
+  negatively cache for hours). A value whose TTL changed is re-appended (never deleted).
+  A changed CNAME is set via `SetRecords` (a CNAME RRset holds one value, so there is no
+  non-empty state to preserve and a single call is preferable). Providers that cannot
+  append/delete individually fall back to `SetRecords`.
 - On error: log and fail unless `BestEffort`.
 
 ### 4.5 Idempotency, ownership & drift
 
-- **Declared `(name,type)` is owned.** `SetRecords` replaces that RRset with exactly the
-  declared values, so re-running converges, updates changed values, and prunes extra
-  values at a declared name/type. Nothing else in the zone is touched.
+- **Declared `(name,type)` is owned.** Reconcile brings that RRset to exactly the
+  declared values: it converges, updates changed values in place, and prunes extra
+  values at a declared name/type. Nothing else in the zone is touched. When the live
+  zone already matches, reconcile issues no writes at all.
 - **Undeclared names persist.** Records whose names were removed from config are not
   deleted automatically — `SetRecords` only receives currently-declared names. This is
   the "only remove when explicitly required" rule.

@@ -93,6 +93,7 @@ type Provider struct {
 	Zone string `json:"zone,omitempty"`
 
 	dnsProvider libdns.RecordSetter
+	appender    libdns.RecordAppender
 	getter      libdns.RecordGetter
 	deleter     libdns.RecordDeleter
 }
@@ -157,6 +158,9 @@ func (a *App) Provision(ctx caddy.Context) error {
 		}
 		p.dnsProvider = setter
 
+		if appender, ok := val.(libdns.RecordAppender); ok {
+			p.appender = appender
+		}
 		if getter, ok := val.(libdns.RecordGetter); ok {
 			p.getter = getter
 		}
@@ -262,54 +266,291 @@ func (a *App) reconcile() error {
 	for i := range a.Providers {
 		p := &a.Providers[i]
 
-		byZone := make(map[string][]libdns.Record)
+		desiredByZone := make(map[string][]libdns.Record)
 		for _, rec := range p.Records {
 			recs, err := rec.libdnsRecords(time.Duration(a.TTL))
 			if err != nil {
 				return err
 			}
-			byZone[rec.Zone] = append(byZone[rec.Zone], recs...)
-		}
-		for zone, recs := range byZone {
-			set, err := p.dnsProvider.SetRecords(ctx, zone, recs)
-			if err != nil {
-				return fmt.Errorf("provider %d: setting records in zone %s: %w", i, zone, err)
-			}
-			a.logger.Info("set DNS records",
-				zap.Int("provider", i),
-				zap.String("zone", zone),
-				zap.Int("count", len(set)))
+			desiredByZone[rec.Zone] = append(desiredByZone[rec.Zone], recs...)
 		}
 
 		removalsByZone := make(map[string][]RemoveSpec)
 		for _, rem := range p.Removals {
 			removalsByZone[rem.Zone] = append(removalsByZone[rem.Zone], rem)
 		}
-		for zone, rems := range removalsByZone {
-			deleted, err := a.deleteResolved(ctx, p, zone, rems)
-			if err != nil {
-				return fmt.Errorf("provider %d: removing records in zone %s: %w", i, zone, err)
+
+		zones := make(map[string]struct{}, len(desiredByZone)+len(removalsByZone))
+		for zone := range desiredByZone {
+			zones[zone] = struct{}{}
+		}
+		for zone := range removalsByZone {
+			zones[zone] = struct{}{}
+		}
+
+		for zone := range zones {
+			// Fetch the live zone once and reuse it for both the record diff
+			// and removal resolution, so we issue at most one read per zone.
+			var live []libdns.Record
+			if p.getter != nil && (len(desiredByZone[zone]) > 0 || len(removalsByZone[zone]) > 0) {
+				var err error
+				live, err = p.getter.GetRecords(ctx, zone)
+				if err != nil {
+					return fmt.Errorf("provider %d: reading records in zone %s: %w", i, zone, err)
+				}
 			}
-			a.logger.Info("removed DNS records",
-				zap.Int("provider", i),
-				zap.String("zone", zone),
-				zap.Int("count", len(deleted)))
+
+			if err := a.reconcileRecords(ctx, p, i, zone, desiredByZone[zone], live); err != nil {
+				return err
+			}
+
+			if rems := removalsByZone[zone]; len(rems) > 0 {
+				deleted, err := a.deleteResolved(ctx, p, zone, rems, live)
+				if err != nil {
+					return fmt.Errorf("provider %d: removing records in zone %s: %w", i, zone, err)
+				}
+				a.logger.Info("removed DNS records",
+					zap.Int("provider", i),
+					zap.String("zone", zone),
+					zap.Int("count", len(deleted)))
+			}
 		}
 	}
 
 	return nil
 }
 
-// deleteResolved deletes the specified records from a zone. It fetches the
-// zone's live records and matches each removal against them, so that deletion
-// is independent of TTL mismatches and so that a whole-RRset removal (no value
-// given) works even with providers that require exact value matches.
-func (a *App) deleteResolved(ctx context.Context, p *Provider, zone string, rems []RemoveSpec) ([]libdns.Record, error) {
-	records, err := p.getter.GetRecords(ctx, zone)
-	if err != nil {
-		return nil, err
+// reconcileRecords brings the declared records for one zone in line with the
+// live zone. It first checks whether the declared (name, type, value) RRsets
+// already match, in which case it does nothing. Otherwise, when the provider
+// supports append + delete, it updates in place by appending new values before
+// deleting stale ones, so an RRset is never momentarily empty (which can be
+// negatively cached by resolvers). Providers that cannot append/delete
+// individually fall back to SetRecords.
+func (a *App) reconcileRecords(ctx context.Context, p *Provider, i int, zone string, desired, live []libdns.Record) error {
+	if len(desired) == 0 {
+		return nil
 	}
 
+	// Without a getter we cannot compare against the live zone; use the
+	// provider's SetRecords, which owns each declared RRset.
+	if p.getter == nil {
+		set, err := p.dnsProvider.SetRecords(ctx, zone, desired)
+		if err != nil {
+			return fmt.Errorf("provider %d: setting records in zone %s: %w", i, zone, err)
+		}
+		a.logger.Info("set DNS records",
+			zap.Int("provider", i),
+			zap.String("zone", zone),
+			zap.Int("count", len(set)))
+		return nil
+	}
+
+	// Guard: if every declared RRset already holds exactly the declared
+	// values, leave the zone untouched. This is what prevents a reload from
+	// needlessly delete/re-adding an unchanged record.
+	if rrsetsMatch(desired, live) {
+		a.logger.Debug("DNS records already up to date",
+			zap.Int("provider", i),
+			zap.String("zone", zone),
+			zap.Int("count", len(desired)))
+		return nil
+	}
+
+	if p.appender != nil && p.deleter != nil {
+		return a.reconcileInPlace(ctx, p, i, zone, desired, live)
+	}
+
+	// Cannot append/delete individually: fall back to SetRecords.
+	set, err := p.dnsProvider.SetRecords(ctx, zone, desired)
+	if err != nil {
+		return fmt.Errorf("provider %d: setting records in zone %s: %w", i, zone, err)
+	}
+	a.logger.Info("set DNS records",
+		zap.Int("provider", i),
+		zap.String("zone", zone),
+		zap.Int("count", len(set)))
+	return nil
+}
+
+// reconcileInPlace updates a zone using the provider's AppendRecords and
+// DeleteRecords. A/AAAA values are appended before stale values are deleted so
+// the RRset never becomes empty (which a resolver could negatively cache).
+// CNAMEs cannot legally coexist, so a changed CNAME is replaced via SetRecords.
+//
+// A value that is still declared but whose TTL changed is refreshed by
+// appending it again; it is never deleted, since providers key records by
+// value and the append already updates the TTL.
+func (a *App) reconcileInPlace(ctx context.Context, p *Provider, i int, zone string, desired, live []libdns.Record) error {
+	desiredByKey := groupByRRset(desired)
+	liveByKey := groupByRRset(live)
+
+	var appendFirst, deleteAfter, cnameChanged []libdns.Record
+	for key, want := range desiredByKey {
+		have := liveByKey[key]
+		for _, w := range want {
+			if containsRecord(have, w) {
+				continue
+			}
+			if key.typ == typeCNAME {
+				cnameChanged = append(cnameChanged, w)
+				continue
+			}
+			// New value, or an existing value whose TTL changed: append
+			// the desired record in both cases.
+			appendFirst = append(appendFirst, w)
+		}
+		for _, h := range have {
+			if containsRecord(want, h) {
+				continue
+			}
+			// Keep a value that is still declared (only its TTL changed);
+			// the append above refreshes it.
+			if containsRecordIgnoringTTL(want, h) {
+				continue
+			}
+			if key.typ == typeCNAME {
+				continue
+			}
+			deleteAfter = append(deleteAfter, h)
+		}
+	}
+
+	// Append new A/AAAA values first: the RRset keeps serving the old values
+	// (and all still-declared values) until the new ones are in place, then
+	// the stale ones are pruned below.
+	if len(appendFirst) > 0 {
+		appended, err := p.appender.AppendRecords(ctx, zone, appendFirst)
+		if err != nil {
+			return fmt.Errorf("provider %d: appending records in zone %s: %w", i, zone, err)
+		}
+		a.logger.Info("appended DNS records",
+			zap.Int("provider", i),
+			zap.String("zone", zone),
+			zap.Int("count", len(appended)))
+	}
+
+	if len(deleteAfter) > 0 {
+		deleted, err := p.deleter.DeleteRecords(ctx, zone, deleteAfter)
+		if err != nil {
+			return fmt.Errorf("provider %d: deleting stale records in zone %s: %w", i, zone, err)
+		}
+		a.logger.Info("deleted stale DNS records",
+			zap.Int("provider", i),
+			zap.String("zone", zone),
+			zap.Int("count", len(deleted)))
+	}
+
+	// A CNAME RRset can hold only one target, so there is no non-empty state
+	// to preserve across a change. Replace it with the provider's SetRecords,
+	// which is a single call and atomic on providers that support it.
+	if len(cnameChanged) > 0 {
+		set, err := p.dnsProvider.SetRecords(ctx, zone, cnameChanged)
+		if err != nil {
+			return fmt.Errorf("provider %d: setting CNAME in zone %s: %w", i, zone, err)
+		}
+		a.logger.Info("set DNS CNAME",
+			zap.Int("provider", i),
+			zap.String("zone", zone),
+			zap.Int("count", len(set)))
+	}
+
+	return nil
+}
+
+// rrsetKey identifies an RRset by its (relative) name and uppercase type.
+type rrsetKey struct {
+	name string
+	typ  string
+}
+
+// groupByRRset groups records by their (name, type) RRset.
+func groupByRRset(recs []libdns.Record) map[rrsetKey][]libdns.Record {
+	out := make(map[rrsetKey][]libdns.Record)
+	for _, rec := range recs {
+		rr := rec.RR()
+		key := rrsetKey{name: normalizeName(rr.Name), typ: strings.ToUpper(rr.Type)}
+		out[key] = append(out[key], rec)
+	}
+	return out
+}
+
+// normalizeName lowercases a relative name and trims a trailing dot so that
+// names compare consistently across providers.
+func normalizeName(name string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+}
+
+// recordsEquivalent reports whether a live record already satisfies a desired
+// record: same (name, type, value), and, when a non-zero TTL is desired, the
+// same TTL. A desired TTL of 0 means "provider default", so the live TTL is
+// not compared in that case.
+func recordsEquivalent(desired, live libdns.Record) bool {
+	d, l := desired.RR(), live.RR()
+	if normalizeName(d.Name) != normalizeName(l.Name) {
+		return false
+	}
+	if !strings.EqualFold(d.Type, l.Type) {
+		return false
+	}
+	if d.Data != l.Data {
+		return false
+	}
+	if d.TTL != 0 && d.TTL != l.TTL {
+		return false
+	}
+	return true
+}
+
+// containsRecord reports whether list holds a record equivalent to want.
+func containsRecord(list []libdns.Record, want libdns.Record) bool {
+	for _, rec := range list {
+		if recordsEquivalent(rec, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsRecordIgnoringTTL reports whether list holds a record with the same
+// (name, type, value) as want, regardless of TTL.
+func containsRecordIgnoringTTL(list []libdns.Record, want libdns.Record) bool {
+	w := want.RR()
+	for _, rec := range list {
+		r := rec.RR()
+		if normalizeName(r.Name) == normalizeName(w.Name) &&
+			strings.EqualFold(r.Type, w.Type) &&
+			r.Data == w.Data {
+			return true
+		}
+	}
+	return false
+}
+
+// rrsetsMatch reports whether every declared RRset already holds exactly the
+// declared values in the live zone. RRsets that are not declared are ignored,
+// so undeclared names keep persisting as before.
+func rrsetsMatch(desired, live []libdns.Record) bool {
+	liveByKey := groupByRRset(live)
+	for key, want := range groupByRRset(desired) {
+		have := liveByKey[key]
+		if len(have) != len(want) {
+			return false
+		}
+		for _, w := range want {
+			if !containsRecord(have, w) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// deleteResolved deletes the specified records from a zone. It matches each
+// removal against the supplied live records, so that deletion is independent of
+// TTL mismatches and so that a whole-RRset removal (no value given) works even
+// with providers that require exact value matches.
+func (a *App) deleteResolved(ctx context.Context, p *Provider, zone string, rems []RemoveSpec, records []libdns.Record) ([]libdns.Record, error) {
 	var toDelete []libdns.Record
 	for _, rem := range rems {
 		name := libdns.RelativeName(rem.Name, zone)
@@ -320,7 +561,7 @@ func (a *App) deleteResolved(ctx context.Context, p *Provider, zone string, rems
 		}
 		for _, rec := range records {
 			rr := rec.RR()
-			if rr.Name != name || rr.Type != typ {
+			if normalizeName(rr.Name) != normalizeName(name) || rr.Type != typ {
 				continue
 			}
 			if len(rem.Value) == 0 || want[rr.Data] {

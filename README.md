@@ -106,8 +106,14 @@ Equivalent JSON:
 
 ### Semantics
 
-- A declared `(name, type)` RRset is owned: each reconcile replaces it with exactly the
+- A declared `(name, type)` RRset is owned: each reconcile brings it to exactly the
   declared values, pruning extras. Nothing else in the zone is touched.
+- Reconcile first reads the zone and compares: if the declared records already match,
+  it makes no provider write at all. Changed A/AAAA records are updated **in place** —
+  new values are appended before stale values are deleted, so an RRset is never
+  momentarily empty. This avoids resolvers caching a transient NXDOMAIN/NODATA for
+  hours. (Only the `ttl` of a record is refreshed by re-appending; a changed CNAME is
+  replaced with a single `SetRecords` call.)
 - Removing a record from config does not delete it; use the `remove` directive to delete
   an entire `(name, type)` RRset or specific values on every reconcile. Removals are
   resolved against the zone's live records first, so they are TTL-independent.
