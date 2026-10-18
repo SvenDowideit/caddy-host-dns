@@ -9,6 +9,16 @@
 			server   bind-e2e:53
 			zone     example.com.
 
+			# SOA: change the timers and the SOA record TTL so the e2e can
+			# prove a reload actually rewrites them.
+			soa {
+				refresh 240s
+				retry   240s
+				expire  480s
+				minimum 30s
+				ttl     180s
+			}
+
 			# MODIFY stage:
 			#  - alpha: prune 172.31.240.10, keep only 172.31.241.10
 			#  - beta : change its A value

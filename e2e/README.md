@@ -17,10 +17,17 @@ Three containers:
 
 Stages (each a `caddy reload` via `docker exec`, then `dig`/`curl` checks):
 
-1. **create** — `alpha` (two A values, one per Caddy endpoint), `beta`, `gamma`.
+1. **create** — `alpha` (two A values, one per Caddy endpoint), `beta`, `gamma`;
+   and set small SOA timers (with `mname`/`rname` inherited from the live zone).
 2. **modify** — prune one of `alpha`'s addresses, change `beta`, add `delta`
-   as a CNAME.
-3. **delete** — explicitly `remove` `beta` and `gamma`.
+   as a CNAME; rewrite the SOA TTL and timers.
+3. **delete** — explicitly `remove` `beta` and `gamma`; no `soa` block, so the
+   SOA RDATA must be left untouched (BIND still auto-increments its serial on
+   any dynamic update).
+
+The SOA checks read the record's own TTL (not just its RDATA) via
+`dig +noall +answer SOA`, so they prove the `soa { ttl ... }` setting takes
+effect against a real provider.
 
 HTTP checks pin the response to each endpoint with `curl --resolve`, and each
 site `bind`s the exact IP endpoint(s) its DNS records point to, so the response

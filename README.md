@@ -6,7 +6,8 @@ Static, provider-agnostic DNS record management for Caddy.
 records for one or more `dns.providers.*` modules compiled into the same Caddy binary.
 It reconciles once at config load and again on every `caddy reload`: records are created
 or updated to match the config, and records can be removed with an explicit `remove`
-directive. There is no polling, no public-IP discovery, and no per-provider code.
+directive. The zone SOA can optionally be set (off by default) with an `soa` block.
+There is no polling, no public-IP discovery, and no per-provider code.
 
 See [caddy-dns-records-module.md](./caddy-dns-records-module.md) for the full design.
 
@@ -121,6 +122,48 @@ Equivalent JSON:
   otherwise set it explicitly (top-level or per provider).
 - `best_effort` downgrades reconcile failures to logged errors instead of failing the
   config load/reload.
+
+### Zone SOA (optional)
+
+By default the app never touches the zone's SOA. Add an `soa` block to a provider to
+manage it, typically to set small, dynamic-DNS-friendly timers:
+
+```
+{
+	dns_records {
+		provider powerdns {env.PD_API_KEY} {
+			zone fi.gy
+			soa {
+				mname ns1.fi.gy.          # primary NS; inherited from the live SOA if omitted
+				rname hostmaster.fi.gy.   # responsible mailbox; inherited if omitted
+				refresh 5m
+				retry 5m
+				expire 10m
+				minimum 1m                # negative-caching TTL (RFC 2308)
+				ttl 1m
+				min_ttl 1m                # raise any duration to the provider's minimum
+				# serial 42               # omit to increment the live serial (or use the clock)
+			}
+			record a.fi.gy A 10.10.0.1
+		}
+	}
+}
+```
+
+- Any timer left out uses a small default (refresh/retry `5m`, expire `10m`,
+  minimum/ttl `1m`), which keeps propagation fast for dynamic use.
+- `min_ttl` is a lower bound applied to every duration, so a provider's minimum TTL is
+  never violated. There is no built-in per-provider minimum table — the app stays
+  provider-agnostic — so set it from your provider's documentation when it enforces one.
+- The SOA is written with `SetRecords` (owning only the apex SOA RRset) and **only when
+  something changed**, so reloads do not churn the serial. When the provider returns the
+  SOA from `GetRecords`, `mname`, `rname`, and the serial are inherited from it and the
+  serial is incremented on a change. If the provider does not return the SOA, set `mname`
+  and `rname` explicitly; the serial then defaults to the current Unix time.
+- SOA management is **advisory**: if the provider rejects or silently ignores the write
+  (many manage the SOA themselves), or the record cannot be built, this is logged as a
+  warning and never fails the config load/reload. Records are unaffected by the
+  app-level `best_effort` setting for this.
 
 ## Provider conformance tests
 

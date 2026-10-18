@@ -58,6 +58,10 @@ type App struct {
 	// Explicit record removals for the legacy single-provider config.
 	Removals []RemoveSpec `json:"remove,omitempty"`
 
+	// Optional SOA management for the legacy single-provider config. When
+	// unset (the default), the zone SOA is left untouched.
+	SOA *SOASpec `json:"soa,omitempty"`
+
 	// Default zone applied to records and removals that do not specify their
 	// own zone, for the legacy single-provider config. Optional; when empty,
 	// the zone is derived from the provider's ZoneLister.
@@ -86,6 +90,10 @@ type Provider struct {
 
 	// Explicit removals; applied on every reconcile.
 	Removals []RemoveSpec `json:"remove,omitempty"`
+
+	// Optional SOA management for this provider's zone. When unset (the
+	// default), the zone SOA is left untouched.
+	SOA *SOASpec `json:"soa,omitempty"`
 
 	// Zone applied to this provider's records and removals that do not specify
 	// their own zone. Optional; when empty, the zone is derived from the
@@ -200,9 +208,64 @@ func (a *App) Provision(ctx caddy.Context) error {
 				return err
 			}
 		}
+		if err := a.resolveSOA(p, i, zones, hasLister); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+// resolveSOA validates the provider's SOA spec and resolves the zone it
+// applies to. The zone is taken from the SOA block, then the provider's zone,
+// then a single zone shared by the provider's records/removals.
+func (a *App) resolveSOA(p *Provider, idx int, zones []libdns.Zone, hasLister bool) error {
+	if p.SOA == nil {
+		return nil
+	}
+	if err := p.SOA.validate(); err != nil {
+		return fmt.Errorf("provider %d: soa: %w", idx, err)
+	}
+	if p.SOA.Zone == "" {
+		p.SOA.Zone = p.Zone
+	}
+	switch {
+	case p.SOA.Zone != "":
+		p.SOA.Zone = canonicalZone(p.SOA.Zone)
+	case sharedZone(p) != "":
+		p.SOA.Zone = sharedZone(p)
+	case hasLister && len(zones) == 1:
+		p.SOA.Zone = canonicalZone(zones[0].Name)
+	case hasLister:
+		return fmt.Errorf("provider %d: soa: a zone is required (set \"zone\" in the soa block or on the provider)", idx)
+	default:
+		return fmt.Errorf("provider %d: soa: a zone is required; the provider does not implement libdns.ZoneLister", idx)
+	}
+	if p.getter == nil && (p.SOA.MName == "" || p.SOA.RName == "") {
+		return fmt.Errorf("provider %d: soa: mname and rname are required when the provider does not implement libdns.RecordGetter", idx)
+	}
+	return nil
+}
+
+// sharedZone returns the single zone used by every record and removal of the
+// provider, or "" when there is none or more than one.
+func sharedZone(p *Provider) string {
+	var z string
+	for _, rec := range p.Records {
+		if z == "" {
+			z = rec.Zone
+		} else if z != rec.Zone {
+			return ""
+		}
+	}
+	for _, rem := range p.Removals {
+		if z == "" {
+			z = rem.Zone
+		} else if z != rem.Zone {
+			return ""
+		}
+	}
+	return z
 }
 
 // listZones returns the provider's zones if it implements libdns.ZoneLister.
@@ -287,17 +350,33 @@ func (a *App) reconcile() error {
 		for zone := range removalsByZone {
 			zones[zone] = struct{}{}
 		}
+		soaZone := ""
+		if p.SOA != nil {
+			soaZone = p.SOA.Zone
+			zones[soaZone] = struct{}{}
+		}
 
 		for zone := range zones {
-			// Fetch the live zone once and reuse it for both the record diff
-			// and removal resolution, so we issue at most one read per zone.
+			// Fetch the live zone once and reuse it for the record diff,
+			// removal resolution, and SOA comparison, so we issue at most one
+			// read per zone.
 			var live []libdns.Record
-			if p.getter != nil && (len(desiredByZone[zone]) > 0 || len(removalsByZone[zone]) > 0) {
+			if p.getter != nil && (len(desiredByZone[zone]) > 0 || len(removalsByZone[zone]) > 0 || (p.SOA != nil && soaZone == zone)) {
 				var err error
 				live, err = p.getter.GetRecords(ctx, zone)
 				if err != nil {
 					return fmt.Errorf("provider %d: reading records in zone %s: %w", i, zone, err)
 				}
+			}
+
+			// Write the SOA before the record updates. Some providers (e.g.
+			// BIND with its default serial-update-method=increment) bump the
+			// SOA serial on every dynamic update, so a serial derived from the
+			// pre-reconcile snapshot would be stale—and lower than the
+			// provider's current serial—by the time the record updates have
+			// run. Writing it first keeps the increment valid.
+			if p.SOA != nil && soaZone == zone {
+				a.reconcileSOA(ctx, p, i, zone, live)
 			}
 
 			if err := a.reconcileRecords(ctx, p, i, zone, desiredByZone[zone], live); err != nil {
@@ -371,6 +450,43 @@ func (a *App) reconcileRecords(ctx context.Context, p *Provider, i int, zone str
 		zap.String("zone", zone),
 		zap.Int("count", len(set)))
 	return nil
+}
+
+// reconcileSOA brings the zone's SOA record in line with the provider's SOA
+// spec. SOA management is advisory: many providers manage the SOA themselves
+// and reject or silently ignore writes, so any failure here is logged and
+// swallowed rather than failing the config load/reload. It does nothing when
+// the live SOA already matches, so a reload does not churn the serial. The SOA
+// is written through SetRecords, which owns only the apex SOA RRset and leaves
+// all other records untouched.
+func (a *App) reconcileSOA(ctx context.Context, p *Provider, i int, zone string, live []libdns.Record) {
+	desired, changed, err := p.SOA.desired(time.Duration(a.TTL), findSOA(live, zone))
+	if err != nil {
+		a.logger.Warn("skipping SOA: could not build the desired record",
+			zap.Int("provider", i),
+			zap.String("zone", zone),
+			zap.Error(err))
+		return
+	}
+	if !changed {
+		a.logger.Debug("DNS SOA already up to date",
+			zap.Int("provider", i),
+			zap.String("zone", zone))
+		return
+	}
+	set, err := p.dnsProvider.SetRecords(ctx, zone, []libdns.Record{desired})
+	if err != nil {
+		a.logger.Warn("could not set SOA (the provider may manage it itself); ignoring",
+			zap.Int("provider", i),
+			zap.String("zone", zone),
+			zap.Error(err))
+		return
+	}
+	a.logger.Info("set DNS SOA",
+		zap.Int("provider", i),
+		zap.String("zone", zone),
+		zap.Int("count", len(set)),
+		zap.String("data", desired.RR().Data))
 }
 
 // reconcileInPlace updates a zone using the provider's AppendRecords and
@@ -583,26 +699,30 @@ func (a *App) normalizeProviders() error {
 			DNSProviderRaw: a.DNSProviderRaw,
 			Records:        a.Records,
 			Removals:       a.Removals,
+			SOA:            a.SOA,
 			Zone:           a.Zone,
 		}}, a.Providers...)
 		a.DNSProviderRaw = nil
 		a.Records = nil
 		a.Removals = nil
+		a.SOA = nil
 		a.Zone = ""
-	} else if len(a.Records) > 0 || len(a.Removals) > 0 || a.Zone != "" {
-		// top-level records/zone without a top-level provider can only belong
-		// to a sole provider that has no records of its own
-		if len(a.Providers) == 1 && a.Providers[0].Records == nil && a.Providers[0].Removals == nil {
+	} else if len(a.Records) > 0 || len(a.Removals) > 0 || a.SOA != nil || a.Zone != "" {
+		// top-level records/zone/soa without a top-level provider can only
+		// belong to a sole provider that has none of its own
+		if len(a.Providers) == 1 && a.Providers[0].Records == nil && a.Providers[0].Removals == nil && a.Providers[0].SOA == nil {
 			a.Providers[0].Records = a.Records
 			a.Providers[0].Removals = a.Removals
+			a.Providers[0].SOA = a.SOA
 			if a.Providers[0].Zone == "" {
 				a.Providers[0].Zone = a.Zone
 			}
 			a.Records = nil
 			a.Removals = nil
+			a.SOA = nil
 			a.Zone = ""
 		} else {
-			return fmt.Errorf("with multiple providers, records, remove and zone must be configured per provider")
+			return fmt.Errorf("with multiple providers, records, remove, soa and zone must be configured per provider")
 		}
 	}
 	if len(a.Providers) == 0 {

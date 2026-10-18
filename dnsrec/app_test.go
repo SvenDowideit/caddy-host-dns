@@ -37,6 +37,7 @@ func init() {
 type fakeProvider struct {
 	Zones    []string `json:"zones,omitempty"`
 	Fail     bool     `json:"fail,omitempty"`
+	FailSet  bool     `json:"fail_set,omitempty"`
 	NoLister bool     `json:"no_lister,omitempty"`
 
 	// Live is the set of records returned by GetRecords.
@@ -86,7 +87,7 @@ func (p *fakeProvider) ListZones(context.Context) ([]libdns.Zone, error) {
 }
 
 func (p *fakeProvider) SetRecords(_ context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
-	if p.Fail {
+	if p.Fail || p.FailSet {
 		return nil, errors.New("boom")
 	}
 	p.sets = append(p.sets, setCall{zone: zone, recs: recs})

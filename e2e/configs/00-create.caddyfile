@@ -9,6 +9,17 @@
 			server   bind-e2e:53
 			zone     example.com.
 
+			# SOA: leave mname/rname unset so they are inherited from the
+			# live zone, and set small dynamic-DNS-friendly timers. The
+			# per-SOA ttl (120s) must win over the app-level ttl (60s).
+			soa {
+				refresh 300s
+				retry   300s
+				expire  600s
+				minimum 60s
+				ttl     120s
+			}
+
 			# CREATE stage: alpha resolves to both Caddy endpoints, beta to
 			# net1, gamma to net2.
 			record alpha.example.com A 172.31.240.10

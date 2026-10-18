@@ -198,6 +198,76 @@ func Test_ParseApp(t *testing.T) {
 			}`,
 		},
 		{
+			name: "per-provider soa block",
+			input: `
+			dns_records {
+				provider test_dummy {
+					api_key secret1
+					zone fi.gy.
+					soa {
+						mname ns1.fi.gy.
+						rname hostmaster.fi.gy.
+						serial 42
+						refresh 5m
+						retry 5m
+						expire 10m
+						minimum 1m
+						ttl 1m
+						min_ttl 1m
+					}
+					record a.fi.gy A 10.10.0.5
+				}
+			}`,
+			want: `{
+				"providers": [{
+					"dns_provider": {"name": "test_dummy", "api_key": "secret1"},
+					"records": [{"name": "a.fi.gy", "type": "A", "value": ["10.10.0.5"]}],
+					"soa": {
+						"mname": "ns1.fi.gy.",
+						"rname": "hostmaster.fi.gy.",
+						"serial": 42,
+						"refresh": 300000000000,
+						"retry": 300000000000,
+						"expire": 600000000000,
+						"minimum": 60000000000,
+						"ttl": 60000000000,
+						"min_ttl": 60000000000
+					},
+					"zone": "fi.gy."
+				}]
+			}`,
+		},
+		{
+			name: "top-level soa folds into sole provider",
+			input: `
+			dns_records {
+				provider test_dummy
+				zone fi.gy.
+				soa {
+					mname ns1.fi.gy.
+				}
+				record a.fi.gy A 10.10.0.5
+			}`,
+			want: `{
+				"providers": [{"dns_provider": {"name": "test_dummy"}}],
+				"records": [{"name": "a.fi.gy", "type": "A", "value": ["10.10.0.5"]}],
+				"soa": {"mname": "ns1.fi.gy."},
+				"zone": "fi.gy."
+			}`,
+		},
+		{
+			name: "unknown soa option",
+			input: `
+			dns_records {
+				provider test_dummy {
+					soa {
+						bogus x
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
 			name: "unrecognized top-level directive",
 			input: `
 			dns_records {

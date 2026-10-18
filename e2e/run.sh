@@ -11,9 +11,10 @@
 # verification step runs through `docker exec` (dig for DNS, curl for HTTP).
 #
 # Stages:
-#   1. create : declare alpha(A x2), beta(A), gamma(A)  -> verify DNS + HTTP
-#   2. modify : prune alpha, change beta, add delta(CNAME) -> verify DNS + HTTP
-#   3. delete : explicitly remove beta and gamma          -> verify DNS + HTTP
+#   1. create : declare alpha(A x2), beta(A), gamma(A); set small SOA timers
+#   2. modify : prune alpha, change beta, add delta(CNAME); change SOA timers
+#   3. delete : explicitly remove beta and gamma; no SOA block (must stay put)
+# Every stage verifies DNS + HTTP.
 #
 # Usage:
 #   ./e2e/run.sh                 # build Caddy via xcaddy (container + host caches)
@@ -55,6 +56,34 @@ dig_a() {
 # dig_cname <name> -> CNAME target (trailing dot stripped)
 dig_cname() {
 	exec_in "$CONT_TOOLS" dig +short CNAME "$1" "@$DNS" 2>/dev/null | sed 's/\.$//' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# soa_answer -> the SOA answer line (name ttl class type mname rname serial
+# refresh retry expire minimum). TTL is the SOA record's own TTL.
+soa_answer() {
+	exec_in "$CONT_TOOLS" dig +noall +answer SOA example.com "@$DNS" 2>/dev/null | awk 'NF >= 11 {print; exit}'
+}
+
+# check_soa <ttl> <refresh> <retry> <expire> <minimum>
+# Retries briefly because the SOA is reconciled after the zone read.
+check_soa() {
+	local want_ttl=$1 want_refresh=$2 want_retry=$3 want_expire=$4 want_minimum=$5
+	local line vals ttl mname rname refresh retry expire minimum i
+	for i in $(seq 1 10); do
+		line=$(soa_answer)
+		vals=$(awk 'NF >= 11 {print $2, $5, $6, $8, $9, $10, $11}' <<<"$line")
+		read -r ttl mname rname refresh retry expire minimum <<<"$vals" || true
+		if [ "$ttl" = "$want_ttl" ] &&
+			[ "$mname" = "ns1.example.net." ] && [ "$rname" = "admin.example.net." ] &&
+			[ "$refresh" = "$want_refresh" ] && [ "$retry" = "$want_retry" ] &&
+			[ "$expire" = "$want_expire" ] && [ "$minimum" = "$want_minimum" ]; then
+			ok "SOA ttl=$ttl refresh=$refresh retry=$retry expire=$expire minimum=$minimum"
+			return 0
+		fi
+		sleep 1
+	done
+	bad "SOA ttl=$ttl mname=$mname rname=$rname refresh=$refresh retry=$retry expire=$expire minimum=$minimum (want ttl=$want_ttl refresh=$want_refresh retry=$want_retry expire=$want_expire minimum=$want_minimum)"
+	return 1
 }
 
 # http_get <host> <caddy-ip> -> response body, pinning the host to one endpoint
@@ -185,6 +214,9 @@ check_a beta.example.com  "$CADDY_NET1_IP"
 check_a gamma.example.com "$CADDY_NET2_IP"
 check_no_a delta.example.com
 
+say "stage 1 SOA: small timers applied, mname/rname inherited"
+check_soa 120 300 300 600 60
+
 say "stage 1 HTTP: each name served from each endpoint with distinct HTML"
 check_http "alpha/net1" alpha.example.com "$CADDY_NET1_IP" alpha
 check_http "alpha/net2" alpha.example.com "$CADDY_NET2_IP" alpha
@@ -199,6 +231,9 @@ say "stage 2 DNS: alpha pruned, beta changed, delta CNAME added"
 check_a alpha.example.com "$CADDY_NET2_IP"
 check_a beta.example.com  "$CADDY_NET2_IP"
 check_cname delta.example.com alpha.example.com
+
+say "stage 2 SOA: ttl and timers rewritten by the reload"
+check_soa 180 240 240 480 30
 
 say "stage 2 HTTP: alpha now only on net2; delta CNAME serves its own site"
 check_http "alpha/net2" alpha.example.com "$CADDY_NET2_IP" alpha
@@ -215,6 +250,12 @@ check_a alpha.example.com "$CADDY_NET2_IP"
 check_cname delta.example.com alpha.example.com
 check_no_a beta.example.com
 check_no_a gamma.example.com
+
+say "stage 3 SOA: no soa block means the SOA RDATA is left untouched"
+# The serial may still move: BIND auto-increments it on any dynamic update
+# (including the record removals done by this stage), independent of our SOA
+# management, so only the timers and TTL are asserted here.
+check_soa 180 240 240 480 30
 
 say "stage 3 HTTP: removed names no longer served"
 check_http "alpha/net2 kept" alpha.example.com "$CADDY_NET2_IP" alpha

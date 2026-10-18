@@ -16,6 +16,7 @@ package dnsrec
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -36,19 +37,33 @@ func init() {
 //			record <name> <type> <value...> [ttl <duration>]
 //			remove <name> <type> [<value...>]
 //			zone <zone>
+//			soa {
+//				mname <ns>
+//				rname <hostmaster>
+//				serial <n>
+//				refresh <duration>
+//				retry <duration>
+//				expire <duration>
+//				minimum <duration>
+//				ttl <duration>
+//				min_ttl <duration>
+//				zone <zone>
+//			}
 //			# ...and any tokens belonging to the DNS provider module
 //		}
 //		record <name> <type> <value...> [ttl <duration>]
 //		remove <name> <type> [<value...>]
 //		zone <zone>
+//		soa { ... }
 //		ttl <duration>
 //		best_effort
 //	}
 //
 // The provider directive may be repeated to manage records across multiple
 // DNS providers, or multiple accounts of the same provider. Inside a provider
-// block, the names "record", "remove", and "zone" are reserved for this module;
-// every other token in the block belongs to the DNS provider module as usual.
+// block, the names "record", "remove", "zone", and "soa" are reserved for this
+// module; every other token in the block belongs to the DNS provider module as
+// usual.
 //
 // Record and remove directives at the top level (outside any provider block)
 // are the legacy single-provider shorthand; they are folded into the sole
@@ -96,6 +111,13 @@ func parseApp(d *caddyfile.Dispenser, _ any) (any, error) {
 				return nil, err
 			}
 			app.Removals = append(app.Removals, rem)
+
+		case "soa":
+			soa, err := parseSOA(d.NextSegment())
+			if err != nil {
+				return nil, err
+			}
+			app.SOA = soa
 
 		case "zone":
 			if !d.NextArg() {
@@ -171,6 +193,82 @@ func parseRemove(d *caddyfile.Dispenser) (RemoveSpec, error) {
 	return rem, nil
 }
 
+// parseSOA parses an "soa" directive segment (the directive token through the
+// end of its block) into an SOASpec. An SOA block is required; there is no
+// inline form.
+//
+//	soa {
+//		mname <ns>
+//		rname <hostmaster>
+//		serial <n>
+//		refresh <duration>
+//		retry <duration>
+//		expire <duration>
+//		minimum <duration>
+//		ttl <duration>
+//		min_ttl <duration>
+//		zone <zone>
+//	}
+func parseSOA(seg caddyfile.Segment) (*SOASpec, error) {
+	d := caddyfile.NewDispenser(seg)
+	if !d.Next() {
+		return nil, d.ArgErr()
+	}
+	soa := new(SOASpec)
+	for d.NextBlock(0) {
+		field := d.Val()
+		switch field {
+		case "mname", "rname", "zone":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			v := d.Val()
+			switch field {
+			case "mname":
+				soa.MName = v
+			case "rname":
+				soa.RName = v
+			case "zone":
+				soa.Zone = v
+			}
+		case "serial":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			n, err := strconv.ParseUint(d.Val(), 10, 32)
+			if err != nil {
+				return nil, d.Errf("soa serial: %v", err)
+			}
+			soa.Serial = uint32(n)
+		case "refresh", "retry", "expire", "minimum", "ttl", "min_ttl":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return nil, d.Errf("soa %s: %v", field, err)
+			}
+			switch field {
+			case "refresh":
+				soa.Refresh = caddy.Duration(dur)
+			case "retry":
+				soa.Retry = caddy.Duration(dur)
+			case "expire":
+				soa.Expire = caddy.Duration(dur)
+			case "minimum":
+				soa.Minimum = caddy.Duration(dur)
+			case "ttl":
+				soa.TTL = caddy.Duration(dur)
+			case "min_ttl":
+				soa.MinTTL = caddy.Duration(dur)
+			}
+		default:
+			return nil, d.Errf("unknown soa option %q", field)
+		}
+	}
+	return soa, nil
+}
+
 // splitValuesTTL separates a record's value arguments from an optional trailing
 // "ttl <duration>".
 func splitValuesTTL(args []string) ([]string, caddy.Duration, error) {
@@ -230,6 +328,12 @@ func splitProviderSegment(seg caddyfile.Segment, prov *Provider) ([]caddyfile.To
 				return nil, err
 			}
 			prov.Removals = append(prov.Removals, rem)
+		case "soa":
+			soa, err := parseSOA(d.NextSegment())
+			if err != nil {
+				return nil, err
+			}
+			prov.SOA = soa
 		case "zone":
 			if !d.NextArg() {
 				return nil, d.ArgErr()
